@@ -238,9 +238,9 @@ class Config:
                     "training_epochs": 75, "training_batch_size": 64
                 },
                 "long": {
-                    "input_time_steps": 200, "prediction_horizon_days": 100, "lstm_layers_count": 2,
-                    "lstm_units_per_layer": 48, "lstm_dropout_rate": 0.3,
-                    "training_epochs": 100, "training_batch_size": 32
+                    "input_time_steps": 120, "prediction_horizon_days": 30, "lstm_layers_count": 2,
+                    "lstm_units_per_layer": 64, "lstm_dropout_rate": 0.2,
+                    "training_epochs": 80, "training_batch_size": 32
                 }
             }
         },
