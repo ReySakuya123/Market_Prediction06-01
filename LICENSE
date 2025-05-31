@@ -652,8 +652,8 @@ class DataFetcher:
                         time.sleep(self.retry_wait_seconds)
                         continue
                     else: # 最終リトライでも不足
-                         self.logger.error(f"{ticker_symbol}: データ行数不足で取得失敗。")
-                         return None
+                        self.logger.error(f"{ticker_symbol}: データ行数不足で取得失敗。")
+                        return None
 
                 self.logger.info(f"{ticker_symbol}: データ取得成功 ({len(df)}行)。")
                 return df
@@ -725,8 +725,8 @@ class DataFetcher:
                                     self.logger.debug(f"古いバックアップファイル(更新日時基準)を削除: {filepath}")
                                     cleaned_count += 1
                         else: # ファイル名形式が合わない場合も最終更新日時
-                             file_mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-                             if (now - file_mod_time).days > self.backup_max_age_days:
+                            file_mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                            if (now - file_mod_time).days > self.backup_max_age_days:
                                 os.remove(filepath)
                                 self.logger.debug(f"古いバックアップファイル(形式不一致、更新日時基準)を削除: {filepath}")
                                 cleaned_count += 1
@@ -842,7 +842,6 @@ class DataFetcher:
         else:
             self.logger.info(f"APIデータ準備完了。{len(market_data_store_api)}個の指数データを取得。")
         return market_data_store_api
-
 
 class FeatureEngineering:
     """特徴量エンジニアリングクラス"""
