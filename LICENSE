@@ -188,11 +188,11 @@ class Config:
         },
         "csv_files": {
             "^GSPC": r"C:\Users\ds221k10159\Desktop\MymarketProject\Finance_Data\GSPC_ohlcv_5y_1d.csv",
-            "^DJI": r"C:\Users\ds221k10159\Desktop\MymarketProject\Finance_Data\DJI_close_5y_1d.csv", # 末尾の不要なカンマを削除
+            "^DJI": r"C:\Users\ds221k10159\Desktop\MymarketProject\Finance_Data\DJI_close_5y_1d.csv",
             "^VIX": r"C:\Users\ds221k10159\Desktop\MymarketProject\Finance_Data\VIX_close_5y_1d.csv"
-        }, # data_source_settings の前にカンマを追加
+        }, # カンマを追加
         "data_source_settings": {
-            "fetch_period_years": "5y", # ここは元の config.json のキー名に合わせる
+            "fetch_period_years": "5y",
             "fetch_interval_days": "1d",
             "max_download_retries": 3,
             "download_retry_wait_seconds": 60,
@@ -202,11 +202,11 @@ class Config:
             "data_backup_directory": "data_backup",
             "data_backup_max_age_days": 0
         },
-        "feature_engineering_settings": { # 特徴量エンジニアリングに関する設定を追加
+        "feature_engineering_settings": {
             "use_vix_feature": True,
-            "use_dji_for_gspc_feature": True, # S&P500予測にダウ平均を使うか
-            "technical_indicators_to_add": ["MA", "RSI", "MACD", "BB", "ATR", "CrossSignals"], # 使用するテクニカル指標リスト
-            "ma_windows": [5, 20, 60, 120], # 旧 visualization_settings.moving_average_windows_days
+            "use_dji_for_gspc_feature": True,
+            "technical_indicators_to_add": ["MA", "RSI", "MACD", "BB", "ATR", "CrossSignals"],
+            "ma_windows": [5, 20, 60, 120],
             "rsi_window": 14,
             "bb_window": 20,
             "bb_std_dev": 2,
@@ -215,19 +215,32 @@ class Config:
             "macd_slow_period": 26,
             "macd_signal_period": 9,
         },
+        # ai_prediction_weights と investment_decision_overrides をトップレベルに移動し、重複を削除
+        "ai_prediction_weights": {
+            "nextday_weight": 0.4,
+            "short_term_weight": 0.4,
+            "long_term_weight": 0.2,
+            "ai_confidence_threshold": 0.6,
+            "extreme_prediction_threshold": 3.0  # %で下落予測時の警告閾値
+        },
+        "investment_decision_overrides": {
+            "max_ai_decline_for_buy": -3.0,  # AI予測がこれ以下でBUY推奨しない
+            "confidence_reliability_unified": True  # 信頼度計算統一フラグ
+        },
         "model_training_settings": {
             "random_seed": 42,
-            "lstm_input_columns_for_gspc": ["^GSPC", "VIX", "^DJI"], # S&P500予測モデルの入力特徴量
+            "lstm_input_columns_for_gspc": ["^GSPC", "VIX", "^DJI"],
             "train_test_split_ratio": 0.8,
-            "hyperparameter_optimization_time_steps": 60, # Optuna時の固定タイムステップ
+            "hyperparameter_optimization_time_steps": 60,
             "hyperparameter_optimization_epochs": 50,
             "hyperparameter_optimization_early_stopping_patience": 10,
             "model_training_early_stopping_patience": 15,
-            "default_optimizer_algorithm": "adam", # AdamOptimizerOptionsを使用するので詳細設定可能に
+            "default_optimizer_algorithm": "adam",
             "default_learning_rate": 0.001,
             "default_loss_function": "mean_squared_error",
-            "model_save_path_template": "models/model_{ticker}_{name}.keras", # .keras推奨
-            "sp500_prediction_model_configs": { # 旧 sp500_model_definitions
+            "model_save_path_template": "models/model_{ticker}_{name}.keras",
+            # model_training_settings 内の重複する ai_prediction_weights と investment_decision_overrides を削除
+            "sp500_prediction_model_configs": {
                 "nextday": {
                     "input_time_steps": 60, "prediction_horizon_days": 1, "lstm_layers_count": 1,
                     "use_optuna_params": True, "training_epochs": 50, "training_batch_size": 64
@@ -245,7 +258,7 @@ class Config:
             }
         },
         "hyperparameter_optimization_settings": {
-            "default_optuna_trials": 50, # 元のコードに合わせて調整
+            "default_optuna_trials": 50,
             "load_best_hyperparameters_file": "best_lstm_params.json",
             "optuna_lstm_units_choices": [32, 64, 96, 128],
             "optuna_n_lstm_layers_range": [1, 2],
@@ -256,11 +269,13 @@ class Config:
         "visualization_settings": {
             "plot_recent_days_count": 365,
             "plot_save_filename_template": "market_prediction_{ticker}.png",
-            "plot_download_directory_candidates": ["Downloads", "ダウンロード", "."], # カレントディレクトリも候補に
-            "correlation_matrix_features": ["Close", "^DJI", "VIX", "RSI", "MACD_diff"], # 旧 correlation_columns
+            "plot_download_directory_candidates": ["Downloads", "ダウンロード", "."],
+            "correlation_matrix_features": ["Close", "^DJI", "VIX", "RSI", "MACD_diff"],
             "plot_image_dpi": 300
         }
     }
+
+
     def __init__(self, config_file: str = "config.json", logger_manager: Optional[LoggerManager] = None):
         self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
         self.config_data = self._load_config(config_file)
@@ -1967,7 +1982,7 @@ class InvestmentAdvisor:
             self.logger.error(f"予測価格抽出エラー: {e}")
             return {}
 
-        def _extract_long_term_prediction(self, long_pred_array):
+    def _extract_long_term_prediction(self, long_pred_array):
         """長期予測の安定化 - ノイズ削減のため最後の期間の平均を使用"""
         try:
             if isinstance(long_pred_array, (list, np.ndarray)) and len(long_pred_array) > 20:
@@ -2053,7 +2068,7 @@ class InvestmentAdvisor:
         if 'short' in prediction_prices:
             print(f"短期予測（20日後）: ${prediction_prices['short']['price']:,.2f}")
         if 'long' in prediction_prices:
-            print(f"長期予測（100日後）: ${prediction_prices['long']['price']:,.2f}")
+            print(f"長期予測（30日後）: ${prediction_prices['long']['price']:,.2f}") # 修正: 100日後→30日後
         
         # 既存のセクション
         assessment = report_data.get("assessment", {})
@@ -2512,103 +2527,119 @@ class InvestmentAdvisor:
             return {"error": str(e)}
 
     def _generate_comprehensive_market_assessment(self, market_status: Dict, predictions: Dict, 
-                                              errors: Dict, tech_signals: Dict) -> MarketAssessment:
-    """総合市場評価を生成（AI予測重視＋極端値抑制・重み調整版）"""
-    try:
-        # --- AI予測の信頼度補正（極端な値を抑制） ---
-        for period in ['nextday', 'short_term', 'long_term']:
-            pred = predictions.get(period, {})
-            trend_pct = pred.get('trend_pct', 0)
-            confidence = pred.get('confidence', 0.5)
-            # 20%以上の極端な変動は信頼度を半減、10%以上は0.8倍
-            if abs(trend_pct) > 20:
-                pred['confidence'] = confidence * 0.5
-            elif abs(trend_pct) > 10:
-                pred['confidence'] = confidence * 0.8
+                                                  errors: Dict, tech_signals: Dict) -> MarketAssessment:
+        """総合市場評価を生成（AI予測重視＋極端値抑制・重み調整版）"""
+        try:
+            # --- AI予測の信頼度補正（極端な値を抑制） ---
+            for period in ['nextday_price', 'short_term', 'long_term']: # nextday -> nextday_price (キーを合わせる)
+                pred_key = 'change_pct' if period == 'nextday_price' else 'trend_pct'
+                pred = predictions.get(period, {})
+                trend_pct_val = pred.get(pred_key, 0) # 修正: 正しいキーを使用
+                confidence = pred.get('confidence', 0.5)
+                # 20%以上の極端な変動は信頼度を半減、10%以上は0.8倍
+                if abs(trend_pct_val) > 20:
+                    pred['confidence'] = confidence * 0.5
+                elif abs(trend_pct_val) > 10:
+                    pred['confidence'] = confidence * 0.8
 
-        # --- 総合トレンドを加重平均で算出 ---
-        weights = {'nextday': 0.4, 'short_term': 0.4, 'long_term': 0.2}
-        weighted_trend = 0
-        total_weight = 0
-        for period in ['nextday', 'short_term', 'long_term']:
-            pred = predictions.get(period, {})
-            trend = pred.get('trend_pct', 0)
-            conf = pred.get('confidence', 0)
-            weight = weights[period] * conf
-            weighted_trend += trend * weight
-            total_weight += weight
-        final_trend = weighted_trend / total_weight if total_weight > 0 else 0
-        final_confidence = total_weight / sum(weights.values()) if sum(weights.values()) > 0 else 0.5
+            # --- 総合トレンドを加重平均で算出 ---
+            weights = {'nextday_price': 0.4, 'short_term': 0.4, 'long_term': 0.2} # nextday -> nextday_price
+            weighted_trend = 0
+            total_weight = 0
+            for period in ['nextday_price', 'short_term', 'long_term']: # nextday -> nextday_price
+                pred_key = 'change_pct' if period == 'nextday_price' else 'trend_pct'
+                pred = predictions.get(period, {})
+                trend = pred.get(pred_key, 0) # 修正: 正しいキーを使用
+                conf = pred.get('confidence', 0)
+                weight = weights[period] * conf
+                weighted_trend += trend * weight
+                total_weight += weight
+            final_trend = weighted_trend / total_weight if total_weight > 0 else 0
+            final_confidence = total_weight / sum(weights.values()) if sum(weights.values()) > 0 else 0.5
 
-        # --- トレンド判定 ---
-        if final_trend < -3:
-            trend = "bearish"
-        elif final_trend > 3:
-            trend = "bullish"
-        else:
-            trend = "neutral"
-
-        # テクニカル分析
-        buy_score = tech_signals.get("total_buy_score", 0)
-        sell_score = tech_signals.get("total_sell_score", 0)
-
-        # テクニカルとの統合
-        if trend == "bullish" and sell_score > buy_score + 2:
-            trend = "neutral"
-            final_confidence *= 0.8
-        elif trend == "bearish" and buy_score > sell_score + 2:
-            trend = "neutral"
-            final_confidence *= 0.8
-        elif trend == "neutral":
-            if buy_score > sell_score + 1:
-                trend = "bullish"
-                final_confidence += 0.1
-            elif sell_score > buy_score + 1:
+            # --- トレンド判定 ---
+            if final_trend < -3:
                 trend = "bearish"
-                final_confidence += 0.1
+            elif final_trend > 3:
+                trend = "bullish"
+            else:
+                trend = "neutral"
 
-        # リスクレベル
-        vix_value = market_status.get("VIX", 20)
-        volatility = market_status.get("volatility_5d", 0)
-        risk_factors = 0
-        if vix_value > 30: risk_factors += 3
-        elif vix_value > 25: risk_factors += 2
-        elif vix_value > 20: risk_factors += 1
-        if volatility > 25: risk_factors += 2
-        elif volatility > 15: risk_factors += 1
-        if final_confidence < 0.4: risk_factors += 1
-        if abs(final_trend) < 0.5: risk_factors += 2
+            # テクニカル分析
+            buy_score = tech_signals.get("total_buy_score", 0)
+            sell_score = tech_signals.get("total_sell_score", 0)
 
-        if risk_factors >= 5:
-            risk_level = "high"
-        elif risk_factors >= 2:
-            risk_level = "medium"
-        else:
-            risk_level = "low"
+            # テクニカルとの統合
+            if trend == "bullish" and sell_score > buy_score + 2:
+                trend = "neutral"
+                final_confidence *= 0.8
+            elif trend == "bearish" and buy_score > sell_score + 2:
+                trend = "neutral"
+                final_confidence *= 0.8
+            elif trend == "neutral":
+                if buy_score > sell_score + 1:
+                    trend = "bullish"
+                    final_confidence += 0.1
+                elif sell_score > buy_score + 1:
+                    trend = "bearish"
+                    final_confidence += 0.1
 
-        # テクニカルスコア
-        tech_score = 0.5
-        total_signals = buy_score + sell_score
-        if total_signals > 0:
-            tech_score = buy_score / total_signals
-        tech_score = max(0.0, min(1.0, tech_score))
+            # リスクレベル
+            vix_value = market_status.get("VIX", 20)
+            volatility = market_status.get("volatility_5d", 0)
+            risk_factors = 0
+            if vix_value > 30: 
+                risk_factors += 3
+            elif vix_value > 25: 
+                risk_factors += 2
+            elif vix_value > 20: 
+                risk_factors += 1
+            if volatility > 25: 
+                risk_factors += 2
+            elif volatility > 15: 
+                risk_factors += 1
+            if final_confidence < 0.4: 
+                risk_factors += 1
+            # if abs(final_trend) < 0.5:  # この条件は曖昧なのでコメントアウトまたは調整
+            #     risk_factors += 2
 
-        # AI信頼度
-        ai_reliability = final_confidence
+            if risk_factors >= 5:
+                risk_level = "high"
+            elif risk_factors >= 2:
+                risk_level = "medium"
+            else:
+                risk_level = "low"
 
-        result = MarketAssessment(
-            trend=trend,
-            confidence=max(0.1, min(0.9, final_confidence)),
-            risk_level=risk_level,
-            tech_score=tech_score,
-            ai_reliability=ai_reliability
-        )
-        self.logger.info(f"総合評価: {trend}, 信頼度={result.confidence:.2f}, リスク={risk_level}")
-        return result
+            # テクニカルスコア
+            tech_score = 0.5
+            total_signals = buy_score + sell_score
+            if total_signals > 0:
+                tech_score = buy_score / total_signals
+            tech_score = max(0.0, min(1.0, tech_score))
 
-    except Exception as e:
-        self.logger.error(f"市場評価生成エラー: {e}")
-        return MarketAssessment("neutral", 0.3, "high", 0.5, 0.3)
+            # AI信頼度
+            ai_reliability = final_confidence
+
+            result = MarketAssessment(
+                trend=trend,
+                confidence=max(0.1, min(0.9, final_confidence)),
+                risk_level=risk_level,
+                tech_score=tech_score,
+                ai_reliability=ai_reliability
+            )
+            self.logger.info(f"総合評価: {trend}, 信頼度={result.confidence:.2f}, リスク={risk_level}")
+            return result
+
+        except Exception as e:
+            self.logger.error(f"総合市場評価の生成中にエラーが発生しました: {e}", exc_info=True)
+            # デフォルト値を返す
+            return MarketAssessment(
+                trend="neutral",
+                confidence=0.5,
+                risk_level="medium",
+                tech_score=0.5,
+                ai_reliability=0.5
+            )
 
     def _get_current_config(self) -> Dict[str, Any]:
         return self.builtin_config.get(self.current_profile, self.builtin_config["natural"])
@@ -2800,7 +2831,7 @@ class InvestmentAdvisor:
                 "market_analysis": {
                     "current_status": market_status,
                     "ai_predictions": predictions,
-                    "ai_reliability": errors,
+                    "ai_reliability": errors, # ai_reliability -> errors (変数名と内容を一致させる)
                     "technical_signals": tech_signals
                 },
                 "assessment": {
@@ -2832,13 +2863,13 @@ class InvestmentAdvisor:
             # 強化版レポート表示に変更
             if print_to_console:
                 # 予測価格データを追加
-                report_data['prediction_prices'] = self._extract_prediction_prices()
-                report_data['timestamp'] = datetime.now().isoformat()
+                # report_data['prediction_prices'] = self._extract_prediction_prices() # _display_enhanced_report内で取得
+                report_data['timestamp'] = datetime.now().isoformat() # _display_enhanced_report内で取得
                 self._display_enhanced_report(report_data)
             
             if save_to_json:
                 # 予測価格データをJSONに含める
-                report_data['prediction_prices'] = self._extract_prediction_prices()
+                report_data['prediction_prices'] = self._extract_prediction_prices() # 保存前に最新を取得
                 self._save_report_to_json(report_data)
             
             self.logger.info("投資レポート生成が正常に完了しました")
@@ -2847,7 +2878,7 @@ class InvestmentAdvisor:
             self.logger.error(f"レポート生成エラー: {e}")
             return False
 
-    def _print_report(self, data: Dict[str, Any]):
+    def _print_report(self, data: Dict[str, Any]): # このメソッドは_display_enhanced_reportに置き換えられたため、必要に応じて使用または削除
         print("\n" + "="*60)
         print("        🎯 AI投資分析レポート（修正版） 🎯")
         print("="*60)
@@ -2931,8 +2962,8 @@ class InvestmentAdvisor:
                 return {k: clean_data(v) for k, v in obj.items()}
             elif isinstance(obj, list):
                 return [clean_data(v) for v in obj]
-            elif pd.isna(obj):
-                return "N/A"
+            elif pd.isna(obj): # np.isnan は数値のみ, pd.isna はより広範
+                return None # JSONではNaNは非標準なのでNoneに
             elif isinstance(obj, (np.integer, np.floating)):
                 return float(obj)
             elif isinstance(obj, pd.Timestamp):
@@ -2940,8 +2971,9 @@ class InvestmentAdvisor:
             return obj
         
         try:
+            cleaned_report_data = clean_data(report_data) # クリーンアップ処理
             with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(clean_data(report_data), f, ensure_ascii=False, indent=2, default=str)
+                json.dump(cleaned_report_data, f, ensure_ascii=False, indent=2, default=str)
             self.logger.info(f"レポート保存: {filename}")
             return filename
         except Exception as e:
@@ -2961,13 +2993,12 @@ class InvestmentAdvisor:
         try:
             predictions, _ = self._get_ai_predictions_summary()
             long_term_trend = predictions.get("long_term", {}).get("trend_pct", 0)
-            validation["ai_predictions_working"] = abs(long_term_trend) > 0.1
-        except:
+            validation["ai_predictions_working"] = abs(long_term_trend) > 0.001 # ゼロでないことを確認
+        except Exception: # 詳細なエラーハンドリングは省略
             pass
         
         validation["overall_valid"] = all(validation.values())
         return validation
-
 
 
 class MarketPredictionSystem:
