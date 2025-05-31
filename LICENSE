@@ -224,7 +224,7 @@ class Config:
             "extreme_prediction_threshold": 3.0  # %で下落予測時の警告閾値
         },
         "investment_decision_overrides": {
-            "max_ai_decline_for_buy": -3.0,  # AI予測がこれ以下でBUY推奨しない
+            "max_ai_decline_for_buy": -2.0,  # AI予測がこれ以下でBUY推奨しない
             "confidence_reliability_unified": True  # 信頼度計算統一フラグ
         },
         "model_training_settings": {
@@ -2570,12 +2570,18 @@ class InvestmentAdvisor:
             sell_score = tech_signals.get("total_sell_score", 0)
 
             # テクニカルとの統合
-            if trend == "bullish" and sell_score > buy_score + 2:
-                trend = "neutral"
-                final_confidence *= 0.8
-            elif trend == "bearish" and buy_score > sell_score + 2:
-                trend = "neutral"
-                final_confidence *= 0.8
+            # テクニカルとAI予測の統合（重み付け改善）
+ai_weight = 0.6  # AI予測の重みを増加
+tech_weight = 0.4  # テクニカルの重みを削減
+
+if trend == "bullish" and sell_score > buy_score + 2:
+    # AI予測が大幅下落の場合はより慎重に
+    if final_trend < -5:
+        trend = "bearish"  # 強制的にbearishに変更
+        final_confidence *= 0.6
+    else:
+        trend = "neutral"
+        final_confidence *= 0.8
             elif trend == "neutral":
                 if buy_score > sell_score + 1:
                     trend = "bullish"
@@ -2708,14 +2714,21 @@ class InvestmentAdvisor:
                 action_strength = "弱"
                 reason = f"信頼度{assessment.confidence:.1%}が閾値{confidence_threshold:.1%}を下回る"
             elif assessment.trend == "bullish" and assessment.risk_level != "high":
-                if abs(ai_trend) > 1 and ai_trend > 0:
-                    primary_action = "BUY"
-                    action_strength = "強" if assessment.confidence > 0.8 and ai_trend > 3 else "中"
-                    reason = f"上昇トレンド確認(AI: +{ai_trend:.1f}%)"
-                else:
-                    primary_action = "BUY" 
-                    action_strength = "弱"
-                    reason = "テクニカル上昇だがAI予測不明確"
+    # AI予測の下落警告を考慮
+    max_decline = self.config.get("investment_decision_overrides.max_ai_decline_for_buy", -3.0)
+    
+    if ai_trend > 0:  # AI予測が上昇
+        primary_action = "BUY"
+        action_strength = "強" if assessment.confidence > 0.8 and ai_trend > 3 else "中"
+        reason = f"上昇トレンド確認(AI: +{ai_trend:.1f}%)"
+    elif ai_trend > max_decline:  # AI予測が軽度下落（-3%以内）
+        primary_action = "BUY"
+        action_strength = "弱"
+        reason = f"テクニカル上昇、AI軽度下落警告あり({ai_trend:.1f}%)"
+    else:  # AI予測が大幅下落（-3%以下）
+        primary_action = "HOLD"
+        action_strength = "中"
+        reason = f"テクニカル上昇だがAI大幅下落警告({ai_trend:.1f}%)"
             elif assessment.trend == "bearish" or (abs(ai_trend) > 1 and ai_trend < -2):
                 primary_action = "SELL"
                 action_strength = "強" if ai_trend < -3 else "中"
