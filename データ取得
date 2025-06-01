@@ -78,7 +78,7 @@ class CSVDataFetcher:
             df['^GSPC'] = df['Close'] # S&P500自身の終値を別名でも保持
 
             if self.use_vix and vix_df is not None and 'Close' in vix_df.columns:
-                vix_aligned = vix_df['Close'].reindex(df.index, method='ffill').fillna(method='bfill')
+                vix_aligned = vix_df['Close'].reindex(df.index).ffill().bfill()
                 df['VIX'] = vix_aligned
                 self.logger.debug("VIXデータをS&P500データに追加しました。")
 
@@ -125,7 +125,7 @@ class CSVDataFetcher:
             df['Volume'] = 0 # Volumeは通常ないので0で埋める
 
             if self.use_vix and vix_df is not None and 'Close' in vix_df.columns:
-                vix_aligned = vix_df['Close'].reindex(df.index, method='ffill').fillna(method='bfill')
+                vix_aligned = vix_df['Close'].reindex(df.index).ffill().bfill()
                 df['VIX'] = vix_aligned
                 self.logger.debug("VIXデータをNYダウデータに追加しました。")
 
