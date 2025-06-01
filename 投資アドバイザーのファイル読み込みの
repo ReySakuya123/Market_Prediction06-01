@@ -1,0 +1,231 @@
+class AdvisorConfigLoader:
+    """投資アドバイザー用設定ファイルの読み込み・プロファイル管理クラス"""
+    DEFAULT_ADVISOR_CONFIG = {
+        "report_filename_template": "market_analysis_report_{profile}.json", # プロファイルごとにも可能
+        "profiles": {
+            "natural": {
+                "profile_description": "標準的なバランス型。基本閾値でシグナル判定。",
+                "signal_thresholds": {"buy": 2, "sell": 2}, "vix_threshold": 25,
+                "short_trend_threshold_pct": 0.5, "error_accept_threshold_pct": 8.0
+            },
+            "aggressive": {
+                "profile_description": "積極型。買い閾値低め、VIX許容高め。",
+                "signal_thresholds": {"buy": 1, "sell": 3}, "vix_threshold": 30,
+                "short_trend_threshold_pct": 0.2, "error_accept_threshold_pct": 10.0
+            },
+            "passive": {
+                "profile_description": "慎重型。買い閾値高め、VIX許容低め。",
+                "signal_thresholds": {"buy": 3, "sell": 1}, "vix_threshold": 20,
+                "short_trend_threshold_pct": 1.0, "error_accept_threshold_pct": 6.0
+            },
+        },
+        "technical_analysis_settings": { # 旧 technical_analysis
+            "buy_signal_columns": ["golden_cross", "RSI_buy_signal", "MACD_buy_signal", "BB_buy_signal"],
+            "sell_signal_columns": ["death_cross", "RSI_sell_signal", "MACD_sell_signal", "BB_sell_signal"],
+            "recent_days_for_signal_count": 5,
+            "ma_cross_signal_recency_days": 10
+        },
+    }
+
+    def __init__(self, config_path: str = "advisor_config.json", logger_manager: Optional[LoggerManager] = None):
+        self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
+        self.config_path = config_path
+        # Configクラスの _deep_update と _load_config を借用 (または共通化)
+        temp_main_config_loader = Config() # ダミーインスタンスでメソッド利用
+        self.config_data = temp_main_config_loader._load_config(config_path) # デフォルトは渡さない
+        # Advisorのデフォルトを適用
+        self.config_data = temp_main_config_loader._deep_update(self.DEFAULT_ADVISOR_CONFIG.copy(), self.config_data)
+
+        self.current_profile_name = "natural" # デフォルト
+        self.set_profile(self.current_profile_name)
+        self.logger.info(f"アドバイザー設定を '{config_path}' からロード。現在のプロファイル: {self.current_profile_name}")
+
+
+    def set_profile(self, profile_name: str) -> bool:
+        profiles = self.config_data.get("profiles", {})
+        if profile_name in profiles:
+            self.current_profile_name = profile_name
+            self.logger.info(f"投資アドバイザープロファイルを '{profile_name}' に変更しました。")
+            return True
+        else:
+            self.logger.warning(f"プロファイル '{profile_name}' は設定に存在しません。'{self.current_profile_name}' を維持します。")
+            return False
+
+    def get_profile_list(self) -> List[str]: return list(self.config_data.get("profiles", {}).keys())
+    def get_current_profile_config(self) -> Dict[str, Any]: return self.config_data.get("profiles", {}).get(self.current_profile_name, {})
+    def get_profile_description(self) -> str: return self.get_current_profile_config().get("profile_description", "説明なし")
+
+    def get_config_value(self, key_path: str, default: Optional[Any] = None) -> Any:
+        keys = key_path.split('.')
+        # 1. プロファイル固有設定
+        val = self.get_current_profile_config()
+        for key in keys:
+            if isinstance(val, dict) and key in val: val = val[key]
+            else: val = None; break # 見つからなければNoneにして共通設定へ
+        if val is not None: return val
+        # 2. 共通設定
+        val_common = self.config_data
+        for key in keys:
+            if isinstance(val_common, dict) and key in val_common: val_common = val_common[key]
+            else: return default # 共通にもなければデフォルト
+        return val_common
+
+
+class MarketDataAnalyzer:
+    """市場データ分析のためのユーティリティ関数群"""
+    
+    def __init__(self, logger_manager: Optional[LoggerManager] = None):
+        self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
+    
+    @staticmethod
+    def get_nested_value(data: dict, keys: list, default=None):
+        """ネストされた辞書から値を安全に取得"""
+        for key in keys:
+            if isinstance(data, dict) and key in data:
+                data = data[key]
+            else:
+                return default
+        return data
+    
+    def find_last_signal_date(self, df: pd.DataFrame, signal_column_name: str) -> Optional[pd.Timestamp]:
+        """指定されたシグナル列の最後の発生日を検索"""
+        if signal_column_name not in df.columns or df[signal_column_name].dtype != 'bool':
+            self.logger.debug(f"シグナル列 '{signal_column_name}' 不在または非bool型。")
+            return None
+        try:
+            true_signals = df.loc[df[signal_column_name]]  # .loc で FutureWarning 回避
+            return pd.Timestamp(true_signals.index.max()) if not true_signals.empty else None
+        except Exception as e:
+            self.logger.warning(f"'{signal_column_name}' 最終シグナル日検索エラー: {e}", exc_info=True)
+            return None
+    
+    def is_date_within_recent_days(self, latest_market_date: pd.Timestamp,
+                                   target_event_date: Optional[pd.Timestamp], recent_days_threshold: int) -> bool:
+        """指定された日付が最近の閾値日数以内かを判定"""
+        if target_event_date is None:
+            return False
+        if not (isinstance(latest_market_date, pd.Timestamp) and isinstance(target_event_date, pd.Timestamp)):
+            self.logger.warning("is_date_within_recent_days: 日付がTimestamp型ではありません。")
+            return False
+        return (latest_market_date - target_event_date).days <= recent_days_threshold
+    
+    def calculate_trend_percentage(self, prediction_array: Any, period_name: str = "期間", 
+                                  current_market_price: Optional[float] = None) -> float:
+        """
+        予測配列から現在価格を基準としたトレンド%を計算
+        
+        Args:
+            prediction_array: 予測価格の配列
+            period_name: ログ用の期間名
+            current_market_price: 現在の市場価格（基準価格）
+        
+        Returns:
+            float: トレンド% (正=上昇、負=下降)
+        """
+        try:
+            # データ型の統一
+            if isinstance(prediction_array, pd.Series):
+                values = prediction_array.dropna().values
+            elif isinstance(prediction_array, np.ndarray):
+                values = prediction_array.flatten()
+            elif isinstance(prediction_array, list):
+                values = np.array([v for v in prediction_array if v is not None and not np.isnan(v)])
+            else:
+                self.logger.warning(f"{period_name}トレンド計算: 未対応型 {type(prediction_array)}")
+                return 0.0
+            
+            if len(values) < 1:
+                self.logger.debug(f"{period_name}トレンド計算: データ点不足 ({len(values)})")
+                return 0.0
+            
+            # 基準価格の決定（現在価格 > 予測の最初の値）
+            if current_market_price is not None and current_market_price > 0:
+                base_price = current_market_price
+            else:
+                base_price = values[0]
+            
+            # 終了価格（予測の最後の値）
+            end_price = values[-1]
+            
+            # バリデーション
+            if base_price <= 0 or np.isnan(base_price) or np.isnan(end_price):
+                self.logger.debug(f"{period_name}トレンド計算: 無効な価格データ (base: {base_price}, end: {end_price})")
+                return 0.0
+            
+            # トレンド%計算（正=上昇、負=下降）
+            trend_pct = ((end_price - base_price) / base_price) * 100
+            
+            self.logger.debug(f"{period_name}トレンド計算: {base_price:.2f} → {end_price:.2f} = {trend_pct:.2f}%")
+            
+            return float(trend_pct)
+            
+        except Exception as e:
+            self.logger.warning(f"{period_name}トレンド計算エラー: {e}", exc_info=True)
+            return 0.0
+    
+    def get_sp500_dataframe(self, market_data_dict: Dict[str, Dict[str, Any]]) -> Optional[pd.DataFrame]:
+        """市場データ辞書からS&P500 DataFrameを取得"""
+        sp500_entry = market_data_dict.get("^GSPC")
+        if not sp500_entry or "df" not in sp500_entry or sp500_entry["df"].empty:
+            self.logger.error("S&P500 DataFrameが見つからないか空です。")
+            return None
+        return sp500_entry["df"]
+
+class ReportGenerator:
+    """レポートの生成（JSON保存、コンソール出力）"""
+    def __init__(self, logger_manager: Optional[LoggerManager] = None):
+        self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
+
+    def save_report_to_json(self, report_data: Dict[str, Any], filename: str):
+        self.logger.info(f"分析レポートを '{filename}' に保存試行...")
+        try:
+            save_dir = os.path.dirname(filename)
+            if save_dir and not os.path.exists(save_dir): os.makedirs(save_dir)
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(report_data, f, indent=2, ensure_ascii=False, default=str) # default=strでdatetime等に対応
+            self.logger.info(f"分析レポートを '{filename}' に保存しました。")
+        except IOError as e: self.logger.error(f"レポート '{filename}' 保存IOエラー: {e}")
+        except Exception as e: self.logger.error(f"レポート '{filename}' 保存中予期せぬエラー: {e}", exc_info=True)
+
+
+    def print_basic_report_to_console(self, report_data: Dict[str, Any]):
+        if not report_data: self.logger.warning("表示するレポートデータが空です。"); return
+        try:
+            print("\n" + "="*10 + " 📈 S&P500 積立タイミング分析レポート 📉 " + "="*10)
+            print(f"分析日時: {report_data.get('analysis_datetime', 'N/A')}")
+            print(f"投資プロファイル: {report_data.get('profile_name', '未設定')} ({report_data.get('profile_description', 'N/A')})")
+            print("-" * 60)
+
+            status = report_data.get('market_status', {})
+            print(f"■ S&P500 現状:")
+            print(f"  - 最新価格 ({status.get('last_price_date', 'N/A')}): {status.get('current_price', 0.0):.2f}")
+            if "VIX" in status: print(f"  - VIX指数: {status['VIX']:.2f}")
+
+            preds = report_data.get('ai_predictions', {})
+            errors = report_data.get('ai_error_rates', {})
+            print("\n■ AI価格予測 (LSTM):")
+            if "nextday_price" in preds:
+                print(f"  - 翌日予測: {preds['nextday_price']:.2f} (MAPE: {errors.get('nextday_mape', 0.0):.2f}%)")
+            short_p = preds.get('short_term', {})
+            if "end_price" in short_p:
+                print(f"  - 短期({short_p.get('days',0)}日後): {short_p['end_price']:.2f} (トレンド: {short_p.get('trend_pct', 0.0):.2f}%, MAPE: {errors.get('short_mape',0.0):.2f}%)")
+            long_p = preds.get('long_term', {})
+            if "end_price" in long_p:
+                print(f"  - 長期({long_p.get('days',0)}日後): {long_p['end_price']:.2f} (トレンド: {long_p.get('trend_pct', 0.0):.2f}%, MAPE: {errors.get('long_mape',0.0):.2f}%)")
+
+            tech = report_data.get('technical_signals', {})
+            print("\n■ テクニカル分析サマリー:")
+            print(f"  - MAクロス: {tech.get('ma_cross_status', '情報なし')}")
+            recent_days = tech.get('recent_days_for_count',0)
+            print(f"  - 直近{recent_days}日のシグナル:")
+            buy_c = tech.get('buy_signal_counts', {})
+            sell_c = tech.get('sell_signal_counts', {})
+            buy_str = ', '.join([f'{k.replace("_signal","")}:{v}' for k,v in buy_c.items() if v>0]) or "なし"
+            sell_str = ', '.join([f'{k.replace("_signal","")}:{v}' for k,v in sell_c.items() if v>0]) or "なし"
+            print(f"    買いシグナル合計: {tech.get('total_buy_score',0)} ({buy_str})")
+            print(f"    売りシグナル合計: {tech.get('total_sell_score',0)} ({sell_str})")
+
+            print("-" * 60)
+            print(f"■ 総合積立アドバイス:\n  {report_data.get('overall_advice', '判断材料不足')}")
+            print("-" * 60 + "\n")
+        except Exception as e: self.logger.error(f"レポートコンソール表示エラー: {e}", exc_info=True)
