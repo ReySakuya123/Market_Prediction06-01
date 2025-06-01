@@ -1,0 +1,514 @@
+
+class CSVDataFetcher:
+    """CSVファイルから市場データを取得するクラス (元のコードベース)"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.logger_manager = logger_manager # パフォーマンスログ用
+
+        self.index_info = config.get("market_index_info", {}) # config.jsonのキー名に合わせる
+        self.csv_files = config.get("csv_files", {}) # このキーはconfig.jsonにないので、別途追加が必要
+        self.use_vix = config.get("feature_engineering_settings.use_vix_feature", True)
+        self.use_dji_for_gspc = config.get("feature_engineering_settings.use_dji_for_gspc_feature", True)
+
+
+    def _load_csv_file(self, file_path: str, ticker: str) -> Optional[pd.DataFrame]:
+        self.logger.info(f"CSVファイル読み込み開始: {ticker} - '{file_path}'")
+        try:
+            if not os.path.exists(file_path):
+                self.logger.error(f"CSVファイルが見つかりません: {file_path}")
+                return None
+
+            df = pd.read_csv(file_path)
+
+            if 'Date' not in df.columns:
+                self.logger.error(f"'Date'列が見つかりません: {file_path}")
+                return None
+
+            # 日付パースの改善
+            try:
+                # タイムゾーン情報が含まれる可能性のあるパターンを正規表現で除去
+                # 例: '2023-01-01 00:00:00-05:00' -> '2023-01-01 00:00:00'
+                df['Date'] = pd.to_datetime(df['Date'].astype(str).str.replace(r'[+-]\d{2}:\d{2}$', '', regex=True), errors='coerce')
+                df.dropna(subset=['Date'], inplace=True) # パース失敗した行は削除
+                df.set_index('Date', inplace=True)
+            except Exception as e:
+                self.logger.error(f"日付列の処理中にエラー ({file_path}): {e}")
+                return None
+
+
+            if df.empty:
+                self.logger.warning(f"CSVファイルに有効なデータがありません (または日付パース後空になった): {file_path}")
+                return None
+
+            # 必要な列の確認 (例: Close)
+            if 'Close' not in df.columns:
+                self.logger.warning(f"'Close'列がありません: {file_path}。ティッカー: {ticker}")
+                # Closeがない場合は処理が難しいのでNoneを返すか、ダミーを入れるか設計による
+                # return None
+
+            # データ型の変換 (数値であるべき列)
+            for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce') # 数値に変換できないものはNaNに
+
+            df.sort_index(inplace=True) # 日付でソート
+            self.logger.info(f"CSVファイル読み込み完了: {ticker} - {len(df)}行 ({df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')})")
+            return df
+
+        except FileNotFoundError: # 上でチェック済みだが念のため
+            self.logger.error(f"CSVファイルが見つかりません (FileNotFoundError): {file_path}")
+            return None
+        except pd.errors.EmptyDataError:
+            self.logger.warning(f"CSVファイルが空です: {file_path}")
+            return None
+        except Exception as e:
+            self.logger.error(f"CSVファイル読み込み中に予期せぬエラー ({file_path}): {e}", exc_info=True)
+            return None
+
+
+    def _prepare_gspc_data(self, gspc_df: pd.DataFrame, vix_df: Optional[pd.DataFrame] = None, dji_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+        self.logger.debug(f"S&P500データ準備開始。元データ {len(gspc_df)}行")
+        try:
+            df = gspc_df.copy()
+            if 'Close' not in df.columns: # 主要な価格データがない場合は処理困難
+                self.logger.error("S&P500データに'Close'列がありません。")
+                return None
+            df['^GSPC'] = df['Close'] # S&P500自身の終値を別名でも保持
+
+            if self.use_vix and vix_df is not None and 'Close' in vix_df.columns:
+                vix_aligned = vix_df['Close'].reindex(df.index, method='ffill').fillna(method='bfill')
+                df['VIX'] = vix_aligned
+                self.logger.debug("VIXデータをS&P500データに追加しました。")
+
+            if self.use_dji_for_gspc and dji_df is not None and 'Close' in dji_df.columns:
+                dji_aligned = dji_df['Close'].reindex(df.index, method='ffill').fillna(method='bfill')
+                df['^DJI'] = dji_aligned
+                self.logger.debug("NYダウデータをS&P500データに追加しました。")
+
+            # OHLCVデータが揃っているか確認 (テクニカル指標計算に影響)
+            # 揃っていなくても処理は続けるが、警告は出す
+            for col in ['Open', 'High', 'Low', 'Volume']:
+                if col not in df.columns:
+                    self.logger.warning(f"S&P500データに'{col}'列がありません。一部テクニカル指標に影響する可能性があります。")
+                    df[col] = df['Close'] # ダミーとしてCloseで埋める (テクニカル指標ライブラリがエラーにならないように)
+
+
+            df.dropna(subset=['^GSPC'], inplace=True) # ^GSPC列にNaNがある行は削除 (主要データなので)
+            if df.empty:
+                self.logger.warning("S&P500データ処理後にデータが空になりました。")
+                return None
+
+            self.logger.info(f"S&P500データ準備完了: {len(df)}行")
+            return df
+        except Exception as e:
+            self.logger.error(f"S&P500データ準備エラー: {e}", exc_info=True)
+            return None
+
+
+    def _prepare_dji_data(self, dji_df: pd.DataFrame, vix_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+        self.logger.debug(f"NYダウデータ準備開始。元データ {len(dji_df)}行")
+        try:
+            if 'Close' not in dji_df.columns:
+                self.logger.error("NYダウデータに'Close'列がありません。")
+                return None
+
+            df = pd.DataFrame(index=dji_df.index)
+            df['Close'] = dji_df['Close']
+            df['^DJI'] = dji_df['Close']
+
+            # NYダウは通常OHLVがない場合が多いので、Closeのみを主要データとする
+            # テクニカル指標計算のためにダミー列を追加
+            for col in ['Open', 'High', 'Low']:
+                df[col] = df['Close']
+            df['Volume'] = 0 # Volumeは通常ないので0で埋める
+
+            if self.use_vix and vix_df is not None and 'Close' in vix_df.columns:
+                vix_aligned = vix_df['Close'].reindex(df.index, method='ffill').fillna(method='bfill')
+                df['VIX'] = vix_aligned
+                self.logger.debug("VIXデータをNYダウデータに追加しました。")
+
+            df.dropna(subset=['^DJI'], inplace=True)
+            if df.empty:
+                self.logger.warning("NYダウデータ処理後にデータが空になりました。")
+                return None
+
+            self.logger.info(f"NYダウデータ準備完了: {len(df)}行")
+            return df
+        except Exception as e:
+            self.logger.error(f"NYダウデータ準備エラー: {e}", exc_info=True)
+            return None
+
+
+    def fetch_all_indexes(self) -> Dict[str, Dict[str, Any]]:
+        """全ての指数データをCSVファイルから取得・準備する"""
+        self.logger.info("CSVファイルからの市場データ読み込み処理開始...")
+        start_time_fetch = datetime.now()
+        fetched_data_store: Dict[str, Dict[str, Any]] = {}
+
+        if not self.csv_files:
+            self.logger.warning("設定に 'csv_files' が定義されていません。CSVデータ取得をスキップします。")
+            return fetched_data_store
+        if not self.index_info:
+            self.logger.warning("設定に 'market_index_info' が定義されていません。主要な処理対象が不明です。")
+            # return fetched_data_store # ここで処理を中断するかどうか
+
+        # 1. 全CSVファイルを読み込み
+        raw_csv_data: Dict[str, pd.DataFrame] = {}
+        tickers_to_load = list(self.index_info.keys())
+        if self.use_vix and '^VIX' not in tickers_to_load:
+            tickers_to_load.append('^VIX') # VIXも対象に
+
+        for ticker in tickers_to_load:
+            file_path = self.csv_files.get(ticker)
+            if file_path:
+                df_loaded = self._load_csv_file(file_path, ticker)
+                if df_loaded is not None and not df_loaded.empty:
+                    raw_csv_data[ticker] = df_loaded
+                else:
+                    self.logger.warning(f"{ticker} のCSVデータ読み込みに失敗またはデータが空でした。")
+            else:
+                self.logger.warning(f"{ticker} のCSVファイルパスが設定 'csv_files' にありません。")
+
+
+        # 2. 各主要指数のデータを準備
+        vix_df_global = raw_csv_data.get('^VIX') if self.use_vix else None
+
+        for ticker, name in self.index_info.items():
+            self.logger.info(f"--- {name} ({ticker}) のデータ準備開始 ---")
+            prepared_df: Optional[pd.DataFrame] = None
+
+            if ticker == '^GSPC':
+                gspc_base_df = raw_csv_data.get('^GSPC')
+                if gspc_base_df is not None:
+                    dji_base_df = raw_csv_data.get('^DJI') if self.use_dji_for_gspc else None
+                    prepared_df = self._prepare_gspc_data(gspc_base_df, vix_df_global, dji_base_df)
+                else:
+                    self.logger.error(f"S&P500 ({ticker}) の元となるCSVデータが読み込まれていません。")
+            elif ticker == '^DJI':
+                dji_base_df = raw_csv_data.get('^DJI')
+                if dji_base_df is not None:
+                    prepared_df = self._prepare_dji_data(dji_base_df, vix_df_global)
+                else:
+                    self.logger.error(f"NYダウ ({ticker}) の元となるCSVデータが読み込まれていません。")
+            # ... 他のティッカーの処理が必要な場合はここに追加 ...
+            else:
+                self.logger.warning(f"ティッカー '{ticker}' のデータ準備ロジックが実装されていません。スキップします。")
+                continue
+
+            if prepared_df is not None and not prepared_df.empty:
+                fetched_data_store[ticker] = {
+                    "df": prepared_df,
+                    "ticker": ticker,
+                    "name": name,
+                    "scaler": None, # スケーラーはモデル学習時に設定
+                    "scaled_data": None, # スケーリング済みデータも同様
+                    "scaled_columns": None
+                }
+                self.logger.info(f"{name} ({ticker}) データ準備完了。期間: "
+                                 f"{prepared_df.index.min().strftime('%Y-%m-%d')} to "
+                                 f"{prepared_df.index.max().strftime('%Y-%m-%d')} ({len(prepared_df)}日分)")
+            else:
+                self.logger.error(f"{name} ({ticker}) のデータ準備に失敗しました。このティッカーは処理対象外となります。")
+
+        duration_ms = (datetime.now() - start_time_fetch).total_seconds() * 1000
+        self.logger_manager.log_performance(
+            "fetch_data_from_csv",
+            {
+                "target_tickers_count": len(self.index_info),
+                "successful_tickers_count": len(fetched_data_store),
+                "duration_ms": round(duration_ms, 2),
+                "loaded_tickers": list(raw_csv_data.keys()),
+                "prepared_tickers": list(fetched_data_store.keys())
+            }
+        )
+
+        if not fetched_data_store:
+            self.logger.critical("有効な市場データをCSVから取得できませんでした。以降の処理に影響が出る可能性があります。")
+        else:
+            self.logger.info(f"CSVデータ準備完了。{len(fetched_data_store)}個の指数データを取得しました。")
+        return fetched_data_store
+
+
+class DataFetcher:
+    """
+    市場データ取得クラス（APIベース - レート制限対策強化版）
+    このクラスは CurlSession が正しくエイリアス設定されていることを前提とする。
+    """
+    def __init__(self, config: 'Config', logger_manager: LoggerManager, session: Optional[Any] = None): # sessionの型はCurlSessionのエイリアス
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.logger_manager = logger_manager
+
+        self.session = session
+        if self.session is None and CurlSession is not None: # グローバルCurlSessionが利用可能ならそれを使う
+            try:
+                if CurlSession.__module__.startswith("curl_cffi"):
+                    self.session = CurlSession(impersonate="chrome110")
+                    self.logger.info("DataFetcher内でCurlSession (curl_cffi) を初期化しました。")
+                else:
+                    self.session = CurlSession()
+                    self.logger.info("DataFetcher内でCurlSession (requests) を初期化しました。")
+            except Exception as e:
+                self.logger.error(f"DataFetcher内でのセッション初期化に失敗: {e}")
+                self.session = None # やはり失敗
+        elif self.session is None and CurlSession is None:
+            self.logger.warning("DataFetcher: HTTPセッションが利用できません。APIベースのデータ取得は機能しません。")
+
+
+        # 設定値の取得 (data_source_settings から)
+        self.index_info = config.get("market_index_info", {})
+        self.period = config.get("data_source_settings.fetch_period_years", "5y")
+        self.interval = config.get("data_source_settings.fetch_interval_days", "1d")
+        self.use_vix = config.get("feature_engineering_settings.use_vix_feature", True) # 特徴量設定から
+        self.use_dji_for_gspc = config.get("feature_engineering_settings.use_dji_for_gspc_feature", True)
+
+        self.max_retries = config.get("data_source_settings.max_download_retries", 3)
+        self.retry_wait_seconds = config.get("data_source_settings.download_retry_wait_seconds", 60)
+        self.inter_ticker_wait_seconds = config.get("data_source_settings.wait_seconds_between_tickers", 15)
+        self.bulk_fail_wait_seconds = config.get("data_source_settings.bulk_download_fail_wait_seconds", 180)
+        self.min_data_rows = config.get("data_source_settings.minimum_required_data_rows", 500)
+        self.data_backup_dir = config.get("data_source_settings.data_backup_directory", "data_backup")
+        self.backup_max_age_days = config.get("data_source_settings.data_backup_max_age_days", 0) # 0は無期限
+
+        # yfinanceのセットアップ (もし使う場合)
+        try:
+            self.yf = install_and_import("yfinance")
+            self.logger.info(f"yfinance version {self.yf.__version__} をロードしました。")
+        except ImportError:
+            self.yf = None
+            self.logger.error("yfinanceライブラリのロードに失敗しました。APIベースのデータ取得は機能しません。")
+
+
+    def _fetch_single_ticker_data_with_retry(self, ticker_symbol: str) -> Optional[pd.DataFrame]:
+        """単一ティッカーのデータをリトライ付きで取得 (yfinanceを使用)"""
+        if not self.yf:
+            self.logger.error("yfinanceが利用不可なため、データ取得できません。")
+            return None
+        if not self.session: # yfinance自体はrequestsを使うが、カスタムセッションを渡せる場合がある
+            self.logger.debug(f"{ticker_symbol}: HTTPセッションがないため、yfinanceのデフォルトセッションを使用します。")
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                self.logger.info(f"{ticker_symbol}: データ取得試行 {attempt + 1}/{self.max_retries + 1} (期間: {self.period}, 間隔: {self.interval})")
+                # yf.Ticker(...).history(...) は内部でHTTPリクエストを行う
+                # カスタムセッションを渡すオプションがあるか確認 (yfinanceのバージョンによる)
+                # 現状のyfinanceでは直接requestsセッションを渡すAPIはない模様。
+                # Proxy設定などはyf.set_proxy()で行う。
+                # レート制限対策は主に時間をおくこと。
+                ticker_obj = self.yf.Ticker(ticker_symbol) #, session=self.session if self.session else None) # session引数は公式にはない
+                df = ticker_obj.history(period=self.period, interval=self.interval, auto_adjust=False) # auto_adjust=FalseでOHLCを保持
+
+                if df.empty:
+                    self.logger.warning(f"{ticker_symbol}: データ取得成功しましたが、DataFrameが空です。")
+                    # 空でも成功として扱い、リトライしない場合もある。ここではリトライ対象とする。
+                    if attempt < self.max_retries:
+                        self.logger.info(f"{ticker_symbol}: {self.retry_wait_seconds}秒待機してリトライします。")
+                        time.sleep(self.retry_wait_seconds)
+                        continue
+                    else: # 最終リトライでも空
+                        return None # 空のDFを返すかNoneを返すか
+
+                # タイムゾーン情報の除去 (Naiveなdatetimeに統一)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+
+                df.dropna(subset=['Close'], inplace=True) # CloseがNaNの行は信頼性が低いので除去
+                if len(df) < self.min_data_rows:
+                    self.logger.warning(f"{ticker_symbol}: 取得データ行数 {len(df)} が最小要件 {self.min_data_rows} 未満です。")
+                    if attempt < self.max_retries:
+                        self.logger.info(f"{ticker_symbol}: {self.retry_wait_seconds}秒待機してリトライします。")
+                        time.sleep(self.retry_wait_seconds)
+                        continue
+                    else: # 最終リトライでも不足
+                        self.logger.error(f"{ticker_symbol}: データ行数不足で取得失敗。")
+                        return None
+
+                self.logger.info(f"{ticker_symbol}: データ取得成功 ({len(df)}行)。")
+                return df
+
+            except requests.exceptions.RequestException as re: # requestsライブラリ由来のエラー
+                self.logger.error(f"{ticker_symbol}: データ取得中にネットワークエラー (試行 {attempt + 1}): {re}")
+            except Exception as e: # yfinance内部エラーやその他の予期せぬエラー
+                self.logger.error(f"{ticker_symbol}: データ取得中に予期せぬエラー (試行 {attempt + 1}): {e}", exc_info=True)
+
+            if attempt < self.max_retries:
+                self.logger.info(f"{ticker_symbol}: {self.retry_wait_seconds}秒待機してリトライします。")
+                time.sleep(self.retry_wait_seconds)
+            else:
+                self.logger.error(f"{ticker_symbol}: 最大リトライ回数({self.max_retries})に達しました。データ取得失敗。")
+        return None
+
+
+    def _backup_data(self, df: pd.DataFrame, ticker_symbol: str) -> None:
+        """DataFrameを指定されたディレクトリにCSVとしてバックアップする"""
+        if not os.path.exists(self.data_backup_dir):
+            try:
+                os.makedirs(self.data_backup_dir)
+                self.logger.info(f"バックアップディレクトリを作成しました: {self.data_backup_dir}")
+            except OSError as e:
+                self.logger.error(f"バックアップディレクトリ作成失敗: {e}. バックアップをスキップします。")
+                return
+
+        # ファイル名: ticker_YYYYMMDD_HHMMSS.csv
+        filename = f"{ticker_symbol.replace('^','')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath = os.path.join(self.data_backup_dir, filename)
+        try:
+            df.to_csv(filepath)
+            self.logger.info(f"{ticker_symbol}のデータをバックアップしました: {filepath}")
+        except IOError as e:
+            self.logger.error(f"{ticker_symbol}のデータバックアップ失敗 ({filepath}): {e}")
+        except Exception as e:
+            self.logger.error(f"{ticker_symbol}のデータバックアップ中に予期せぬエラー: {e}", exc_info=True)
+
+
+    def _cleanup_old_backups(self) -> None:
+        """古いバックアップファイルを削除する"""
+        if self.backup_max_age_days <= 0: # 0以下なら削除しない
+            return
+        if not os.path.exists(self.data_backup_dir):
+            return
+
+        self.logger.info(f"古いバックアップファイルのクリーンアップ開始 (保持期間: {self.backup_max_age_days}日)...")
+        now = datetime.now()
+        cleaned_count = 0
+        try:
+            for filename in os.listdir(self.data_backup_dir):
+                filepath = os.path.join(self.data_backup_dir, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        # ファイル名から日付をパースする試み (例: ticker_YYYYMMDD_HHMMSS.csv)
+                        parts = filename.split('_')
+                        if len(parts) >= 2:
+                            date_str = parts[-2] # YYYYMMDD
+                            if len(date_str) == 8 and date_str.isdigit():
+                                file_date = datetime.strptime(date_str, "%Y%m%d")
+                                if (now - file_date).days > self.backup_max_age_days:
+                                    os.remove(filepath)
+                                    self.logger.debug(f"古いバックアップファイルを削除しました: {filepath}")
+                                    cleaned_count += 1
+                            else: # 日付形式でないファイルは最終更新日時で判断
+                                file_mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                                if (now - file_mod_time).days > self.backup_max_age_days:
+                                    os.remove(filepath)
+                                    self.logger.debug(f"古いバックアップファイル(更新日時基準)を削除: {filepath}")
+                                    cleaned_count += 1
+                        else: # ファイル名形式が合わない場合も最終更新日時
+                            file_mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                            if (now - file_mod_time).days > self.backup_max_age_days:
+                                os.remove(filepath)
+                                self.logger.debug(f"古いバックアップファイル(形式不一致、更新日時基準)を削除: {filepath}")
+                                cleaned_count += 1
+                    except ValueError: # 日付パース失敗
+                        self.logger.debug(f"バックアップファイル名から日付をパースできませんでした: {filename}")
+                    except OSError as e_remove:
+                        self.logger.warning(f"バックアップファイル削除エラー ({filepath}): {e_remove}")
+            if cleaned_count > 0:
+                self.logger.info(f"{cleaned_count}個の古いバックアップファイルを削除しました。")
+            else:
+                self.logger.info("削除対象の古いバックアップファイルはありませんでした。")
+        except Exception as e:
+            self.logger.error(f"バックアップクリーンアップ中に予期せぬエラー: {e}", exc_info=True)
+
+    def fetch_all_indexes(self) -> Dict[str, Dict[str, Any]]:
+        """
+        設定された全ての指数データをAPI経由で取得・準備する。
+        CSVDataFetcher と同じ出力形式の辞書を返す。
+        """
+        self.logger.info("API経由での市場データ取得処理開始...")
+        start_time_fetch_api = datetime.now()
+        market_data_store_api: Dict[str, Dict[str, Any]] = {}
+
+        if not self.yf:
+            self.logger.critical("yfinanceが利用できないため、APIでのデータ取得は不可能です。")
+            return market_data_store_api
+        if not self.index_info:
+            self.logger.warning("設定 'market_index_info' が空です。取得対象がありません。")
+            return market_data_store_api
+
+        tickers_to_process = list(self.index_info.keys())
+        if self.use_vix and '^VIX' not in tickers_to_process:
+            tickers_to_process.append('^VIX')
+
+        raw_fetched_dfs: Dict[str, pd.DataFrame] = {}
+        failed_tickers: List[str] = []
+
+        # 1. 各ティッカーの生データを取得
+        for i, ticker in enumerate(tickers_to_process):
+            df_raw = self._fetch_single_ticker_data_with_retry(ticker)
+            if df_raw is not None and not df_raw.empty:
+                raw_fetched_dfs[ticker] = df_raw
+                self._backup_data(df_raw, ticker) # 取得成功したらバックアップ
+            else:
+                self.logger.error(f"{ticker} のデータ取得に最終的に失敗しました。")
+                failed_tickers.append(ticker)
+
+            if i < len(tickers_to_process) - 1 and self.inter_ticker_wait_seconds > 0: # 最後のティッカー以外
+                self.logger.debug(f"{self.inter_ticker_wait_seconds}秒待機 (次のティッカー取得前)...")
+                time.sleep(self.inter_ticker_wait_seconds)
+
+        if len(failed_tickers) == len(tickers_to_process) and tickers_to_process: # 全滅した場合
+            self.logger.critical(f"全てのティッカー ({', '.join(failed_tickers)}) のデータ取得に失敗しました。{self.bulk_fail_wait_seconds}秒待機します。")
+            time.sleep(self.bulk_fail_wait_seconds)
+            # ここで処理を中断するか、空のデータを返すかは設計による
+            return market_data_store_api
+
+
+        # 2. CSVDataFetcherと同様のデータ準備ロジックを適用
+        #    CSVDataFetcherのメソッドを再利用できるように、一時的なCSVFetcherインスタンスを作るか、
+        #    準備ロジックを共通化する。ここでは簡易的にCSVFetcherの準備メソッドを呼び出す。
+        temp_csv_fetcher = CSVDataFetcher(self.config, self.logger_manager) # logger_managerを渡す
+        vix_df_global_api = raw_fetched_dfs.get('^VIX') if self.use_vix else None
+
+        for ticker, name in self.index_info.items():
+            if ticker in failed_tickers: # 生データ取得失敗したものはスキップ
+                continue
+
+            self.logger.info(f"--- {name} ({ticker}) のAPI取得データ準備開始 ---")
+            prepared_df_api: Optional[pd.DataFrame] = None
+            base_df = raw_fetched_dfs.get(ticker)
+
+            if base_df is None or base_df.empty:
+                self.logger.error(f"{name} ({ticker}) の元となるAPIデータがありません。")
+                continue
+
+            if ticker == '^GSPC':
+                dji_base_df_api = raw_fetched_dfs.get('^DJI') if self.use_dji_for_gspc else None
+                prepared_df_api = temp_csv_fetcher._prepare_gspc_data(base_df, vix_df_global_api, dji_base_df_api)
+            elif ticker == '^DJI':
+                prepared_df_api = temp_csv_fetcher._prepare_dji_data(base_df, vix_df_global_api)
+            # ... 他のティッカー ...
+            else:
+                self.logger.warning(f"ティッカー '{ticker}' のAPIデータ準備ロジックが未実装。元データをそのまま使用します。")
+                prepared_df_api = base_df # とりあえずそのまま格納
+
+            if prepared_df_api is not None and not prepared_df_api.empty:
+                market_data_store_api[ticker] = {
+                    "df": prepared_df_api, "ticker": ticker, "name": name,
+                    "scaler": None, "scaled_data": None, "scaled_columns": None
+                }
+                self.logger.info(f"{name} ({ticker}) APIデータ準備完了。 ({len(prepared_df_api)}日分)")
+            else:
+                self.logger.error(f"{name} ({ticker}) のAPIデータ準備に失敗。")
+
+        self._cleanup_old_backups() # 古いバックアップを削除
+
+        duration_ms_api = (datetime.now() - start_time_fetch_api).total_seconds() * 1000
+        self.logger_manager.log_performance(
+            "fetch_data_from_api",
+            {
+                "target_tickers_count": len(self.index_info),
+                "successful_tickers_count": len(market_data_store_api),
+                "duration_ms": round(duration_ms_api, 2),
+                "fetched_tickers_raw": list(raw_fetched_dfs.keys()),
+                "prepared_tickers": list(market_data_store_api.keys()),
+                "failed_tickers_raw": failed_tickers
+            }
+        )
+
+        if not market_data_store_api:
+            self.logger.critical("API経由で有効な市場データを取得できませんでした。")
+        else:
+            self.logger.info(f"APIデータ準備完了。{len(market_data_store_api)}個の指数データを取得。")
+        return market_data_store_api
