@@ -36,7 +36,7 @@ class LSTMModel:
         try:
             with open(load_path, "r", encoding="utf-8") as f:
                 self.best_params = json.load(f)
-            self.logger.info(f"ハイパーパラメータをロードしました: {self.best_pLarams}")
+            self.logger.info(f"ハイパーパラメータをロードしました: {self.best_params}")
             return True
         except FileNotFoundError:
             self.logger.info(f"ハイパーパラメータファイル '{load_path}' が見つかりません。")
@@ -444,7 +444,7 @@ class LSTMModel:
             try:
                 save_dir = os.path.dirname(model_save_path)
                 if save_dir and not os.path.exists(save_dir): os.makedirs(save_dir)
-                save_model(model, model_save_path, save_format="keras") # .keras形式で保存
+                save_model(model, model_save_path)
                 self.logger.info(f"'{model_name}'モデル ({target_ticker}) を '{model_save_path}' に保存。")
             except Exception as e:
                 self.logger.error(f"モデル保存エラー ({model_save_path}): {e}", exc_info=True)
