@@ -1,0 +1,460 @@
+
+class LSTMModel:
+    """LSTMモデル訓練と予測クラス"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.logger_manager = logger_manager # パフォーマンスログ用
+
+        self.model_settings = config.get("model_training_settings", {})
+        self.opt_settings = config.get("hyperparameter_optimization_settings", {})
+
+        self.seed = self.model_settings.get("random_seed", 42)
+        self.set_random_seed()
+
+        self.best_params: Optional[Dict[str, Any]] = None
+        self.hyperparams_file = self.opt_settings.get("load_best_hyperparameters_file", "best_lstm_params.json")
+
+
+    def set_random_seed(self):
+        """各種ライブラリの乱数シードを設定する"""
+        os.environ['PYTHONHASHSEED'] = str(self.seed)
+        os.environ['TF_DETERMINISTIC_OPS'] = '1' # TFの決定論的動作 (可能な範囲で)
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        tf.random.set_seed(self.seed)
+        if optuna: # optunaがインポートされていれば、その乱数シードも設定
+            # TPESamplerのseedはStudy作成時に指定
+            pass
+        self.logger.debug(f"乱数シードを {self.seed} に設定しました。")
+
+
+    def load_best_params(self, filepath: Optional[str] = None) -> bool:
+        load_path = filepath or self.hyperparams_file
+        self.logger.info(f"最適化済みハイパーパラメータを '{load_path}' からロード試行...")
+        try:
+            with open(load_path, "r", encoding="utf-8") as f:
+                self.best_params = json.load(f)
+            self.logger.info(f"ハイパーパラメータをロードしました: {self.best_pLarams}")
+            return True
+        except FileNotFoundError:
+            self.logger.info(f"ハイパーパラメータファイル '{load_path}' が見つかりません。")
+            self.best_params = None
+            return False
+        except json.JSONDecodeError as e:
+            self.logger.error(f"ハイパーパラメータファイル '{load_path}' のJSONパースエラー: {e}")
+            self.best_params = None
+            return False
+        except Exception as e:
+            self.logger.error(f"ハイパーパラメータファイル '{load_path}' のロード中に予期せぬエラー: {e}", exc_info=True)
+            self.best_params = None
+            return False
+
+    def save_best_params(self, params: Dict[str, Any], filepath: Optional[str] = None):
+        save_path = filepath or self.hyperparams_file
+        self.logger.info(f"最適ハイパーパラメータを '{save_path}' に保存試行...")
+        try:
+            # 保存先ディレクトリが存在しない場合は作成
+            save_dir = os.path.dirname(save_path)
+            if save_dir and not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+                self.logger.info(f"保存先ディレクトリを作成しました: {save_dir}")
+
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(params, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"最適ハイパーパラメータを '{save_path}' に保存しました。")
+        except IOError as e:
+            self.logger.error(f"ハイパーパラメータのファイル保存IOエラー ({save_path}): {e}")
+        except Exception as e:
+            self.logger.error(f"ハイパーパラメータの保存中に予期せぬエラー ({save_path}): {e}", exc_info=True)
+
+
+    def _prepare_data_for_lstm(
+        self, df: pd.DataFrame, ticker_symbol: str
+    ) -> Tuple[Optional[np.ndarray], Optional[MinMaxScaler], Optional[List[str]], Optional[pd.Index]]:
+        """DataFrameからLSTMモデル用のスケーリング済み多変量データを準備する。スケーリングに使ったインデックスも返す。"""
+        self.logger.debug(f"{ticker_symbol}: LSTM用データ準備開始...")
+
+        # スケーリング対象列 (S&P500の場合のみ特別扱い、他はCloseのみなど柔軟に)
+        if ticker_symbol == "^GSPC":
+            potential_cols = self.model_settings.get("lstm_input_columns_for_gspc", ["^GSPC", "VIX", "^DJI"])
+        else: # 他のティッカーは自身の終値のみ、または設定で指定
+            potential_cols = [ticker_symbol] # configで指定できるようにしても良い
+
+        cols_for_scaling = [col for col in potential_cols if col in df.columns and df[col].isnull().sum() < len(df)] # 全てNaNの列は除外
+        if not cols_for_scaling or ticker_symbol not in cols_for_scaling: # ticker_symbol自体が含まれているか
+             # S&P500以外でティッカー名が 'Close' と異なる場合、ticker_symbolの代わりに 'Close' を探す
+            if ticker_symbol not in cols_for_scaling and 'Close' in df.columns:
+                cols_for_scaling = ['Close'] # 主対象をCloseとする
+                if 'VIX' in df.columns and self.config.get("feature_engineering_settings.use_vix_feature"):
+                    cols_for_scaling.append('VIX')
+            else:
+                self.logger.error(f"{ticker_symbol}: LSTM用データ準備エラー。スケーリング対象の主列が見つかりません。候補: {potential_cols}, 存在列: {list(df.columns)}")
+                return None, None, None, None
+
+        # 欠損値処理: LSTM入力前には欠損がない状態にする
+        # ここではdropnaするが、より高度な補完処理も検討可能 (例: ffill後bfill)
+        # df_processed = df[cols_for_scaling].fillna(method='ffill').fillna(method='bfill') # 先に補完
+        # data_to_scale = df_processed.dropna() # それでも残るNaNがあれば削除
+        data_to_scale = df[cols_for_scaling].dropna() # シンプルにdropna
+
+        if data_to_scale.empty:
+            self.logger.error(f"{ticker_symbol}: LSTM用データ準備エラー。dropna後データが空になりました。対象列: {cols_for_scaling}")
+            return None, None, None, None
+
+        original_index = data_to_scale.index # スケーリングに使用したデータのインデックスを保持
+
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        try:
+            scaled_data = scaler.fit_transform(data_to_scale)
+        except Exception as e:
+            self.logger.error(f"{ticker_symbol}: データスケーリング中にエラー: {e}", exc_info=True)
+            return None, None, None, None
+
+        self.logger.info(f"{ticker_symbol}: LSTM用データ準備完了。スケーリング対象列: {cols_for_scaling}, スケーリング後形状: {scaled_data.shape}")
+        return scaled_data, scaler, cols_for_scaling, original_index
+
+
+    def create_multivariate_dataset(
+        self, data: np.ndarray, time_step: int, predict_step: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        X, y = [], []
+        if data.ndim == 1: data = data.reshape(-1, 1)
+
+        if len(data) <= time_step + predict_step -1: # データが足りない場合 (等号を含む)
+            self.logger.warning(f"データ長({len(data)})がtime_step({time_step}) + predict_step({predict_step})に対して不足。データセット作成不可。")
+            return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+        for i in range(len(data) - time_step - predict_step + 1):
+            X.append(data[i:(i + time_step), :])
+            y.append(data[i + time_step : i + time_step + predict_step, 0]) # 予測対象は常に最初の特徴量
+        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+    def _split_train_test(
+        self, X: np.ndarray, y: np.ndarray, train_ratio: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if len(X) == 0: return np.array([]), np.array([]), np.array([]), np.array([])
+        
+        train_size = int(len(X) * train_ratio)
+        # 訓練データ、テストデータが最低1サンプルは存在するように調整
+        if train_size <= 0 and len(X) > 1: train_size = 1 # 少なくとも1つは訓練
+        if train_size >= len(X) and len(X) > 1: train_size = len(X) - 1 # 少なくとも1つはテスト
+
+        if train_size == 0 and len(X) > 0 : # データが1つしかない場合など
+             self.logger.warning(f"データ数が非常に少ないため({len(X)}サンプル)、train_sizeが0。全てを訓練/テストデータとします。")
+             return X, X, y, y # 訓練とテストを同じにする（評価には不適切だが実行は可能）
+        if train_size == len(X):
+             self.logger.warning(f"データ数が非常に少ないため({len(X)}サンプル)、全て訓練データ。テストデータを複製します。")
+             return X, X, y, y
+
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+        return X_train, X_test, y_train, y_test
+
+
+    def _build_model(
+        self, input_shape: Tuple[int, int], lstm_units: int, dropout_rate: float,
+        predict_step: int, n_lstm_layers: int = 1, learning_rate: Optional[float] = None,
+    ) -> tf.keras.Model:
+        tf.keras.backend.clear_session() # モデル構築前にセッションクリア
+        self.set_random_seed() # 再現性のためにここでもシード設定
+
+        model = Sequential()
+        for i in range(n_lstm_layers):
+            return_sequences = True if i < n_lstm_layers - 1 else False # 最後のLSTM層以外はTrue
+            if i == 0: # 最初の層のみinput_shapeを指定
+                model.add(LSTM(lstm_units, return_sequences=return_sequences, input_shape=input_shape))
+            else:
+                model.add(LSTM(lstm_units, return_sequences=return_sequences))
+            model.add(Dropout(dropout_rate))
+
+        model.add(Dense(predict_step)) # 出力層: 予測ステップ数分のユニット
+
+        optimizer_name = self.model_settings.get("default_optimizer_algorithm", "adam").lower()
+        final_learning_rate = learning_rate if learning_rate is not None else self.model_settings.get("default_learning_rate", 0.001)
+
+        if optimizer_name == "adam":
+            optimizer = KerasAdam(learning_rate=final_learning_rate) # tensorflow.keras.optimizers.Adam を使用
+        else: # 他のオプティマイザ (例: RMSprop)
+            self.logger.warning(f"オプティマイザ '{optimizer_name}' はAdam以外未実装です。Adam (lr={final_learning_rate}) を使用します。")
+            optimizer = KerasAdam(learning_rate=final_learning_rate)
+
+        loss_function = self.model_settings.get("default_loss_function", 'mean_squared_error')
+        model.compile(optimizer=optimizer, loss=loss_function)
+        # self.logger.debug(f"モデル構築完了: LSTM層={n_lstm_layers}, Units={lstm_units}, Dropout={dropout_rate}, LR={final_learning_rate}, Loss={loss_function}")
+        # model.summary(print_fn=self.logger.debug) # ログにサマリ出力
+        return model
+
+
+    def _inverse_transform_predictions(
+        self, scaler: MinMaxScaler, predictions: np.ndarray, num_scaled_features: int
+    ) -> np.ndarray:
+        if predictions.ndim == 1: predictions = predictions.reshape(-1, 1)
+        if predictions.shape[1] > 1 and predictions.shape[1] != num_scaled_features :
+             # 複数ステップ予測の場合、predictionsは(samples, predict_steps)
+             # 逆変換は各ステップごとに行う必要がある
+             # ここでは、予測対象は常に最初の特徴量であると仮定している
+             inverted_preds_list = []
+             for step_idx in range(predictions.shape[1]): # 各予測ステップに対して
+                dummy_step_pred = np.zeros((predictions.shape[0], num_scaled_features))
+                dummy_step_pred[:, 0] = predictions[:, step_idx]
+                inverted_step = scaler.inverse_transform(dummy_step_pred)[:, 0]
+                inverted_preds_list.append(inverted_step)
+             return np.array(inverted_preds_list).T # (samples, predict_steps) に転置
+
+        # 1ステップ予測または1特徴量予測の場合
+        dummy_predictions = np.zeros((predictions.shape[0], num_scaled_features))
+        dummy_predictions[:, 0] = predictions[:, 0] # 予測値を最初の列に配置
+        try:
+            original_scale_predictions_full = scaler.inverse_transform(dummy_predictions)
+            return original_scale_predictions_full[:, 0].reshape(-1, 1) # 最初の列のみ返す
+        except ValueError as ve: # スケーラーの特徴量数と合わない場合など
+            self.logger.error(f"逆変換エラー: {ve}. Scaler features: {getattr(scaler, 'n_features_in_', 'N/A')}, Preds shape for dummy: {dummy_predictions.shape}")
+            return predictions # エラー時はスケールされた値をそのまま返す
+        except Exception as e:
+            self.logger.error(f"予期せぬ逆変換エラー: {e}", exc_info=True)
+            return predictions
+
+    def optimize_hyperparameters(
+        self, market_data_dict: Dict[str, Dict[str, Any]], target_ticker: str = "^GSPC",
+        n_trials: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        self.logger.info(f"Optunaによるハイパーパラメータ最適化開始 (対象: {target_ticker})")
+        start_time_opt = datetime.now()
+
+        n_trials_actual = n_trials if n_trials is not None else self.opt_settings.get("default_optuna_trials", 50)
+        if n_trials_actual <= 0:
+            self.logger.warning("Optuna試行回数が0以下です。最適化をスキップします。")
+            return self.best_params # 既存のパラメータを返すか、None
+
+        df_target = market_data_dict.get(target_ticker, {}).get("df")
+        if df_target is None or df_target.empty:
+            self.logger.error(f"最適化対象 {target_ticker} のDataFrameが見つからないか空です。最適化中止。")
+            return None
+
+        scaled_data, scaler, scaled_cols, _ = self._prepare_data_for_lstm(df_target, target_ticker)
+        if scaled_data is None or scaler is None or not scaled_cols:
+            self.logger.error(f"{target_ticker}: LSTM用データ準備失敗。最適化中止。")
+            return None
+
+        time_step_opt = self.model_settings.get("hyperparameter_optimization_time_steps", 60)
+        predict_step_opt = 1 # 翌日予測で最適化 (固定)
+
+        X_all, y_all = self.create_multivariate_dataset(scaled_data, time_step_opt, predict_step_opt)
+        if X_all.shape[0] == 0:
+            self.logger.error(f"{target_ticker}: Optuna用データセット作成失敗。データ不足の可能性。最適化中止。")
+            return None
+
+        train_ratio_opt = self.model_settings.get("train_test_split_ratio", 0.8)
+        X_train_opt, X_val_opt, y_train_opt, y_val_opt = self._split_train_test(X_all, y_all, train_ratio=train_ratio_opt)
+        if X_train_opt.shape[0] == 0 or X_val_opt.shape[0] == 0:
+            self.logger.error(f"{target_ticker}: Optuna用訓練/検証データが空。データ不足の可能性。最適化中止。")
+            return None
+
+        def objective(trial: optuna.Trial) -> float:
+            # ハイパーパラメータの提案範囲 (configから取得)
+            lstm_units = trial.suggest_categorical('lstm_units', self.opt_settings.get("optuna_lstm_units_choices", [64, 128]))
+            n_lstm_layers = trial.suggest_int('n_lstm_layers', *self.opt_settings.get("optuna_n_lstm_layers_range", [1,2]))
+            dropout_rate = trial.suggest_float('dropout_rate', *self.opt_settings.get("optuna_dropout_rate_range", [0.1, 0.5]))
+            learning_rate = trial.suggest_float('learning_rate', *self.opt_settings.get("optuna_learning_rate_range", [1e-4, 1e-2]), log=True)
+            batch_size = trial.suggest_categorical('batch_size', self.opt_settings.get("optuna_batch_size_choices", [32, 64]))
+            epochs_opt = self.model_settings.get("hyperparameter_optimization_epochs", 50)
+
+            model = self._build_model(
+                input_shape=(X_train_opt.shape[1], X_train_opt.shape[2]),
+                lstm_units=lstm_units, n_lstm_layers=n_lstm_layers, dropout_rate=dropout_rate,
+                predict_step=predict_step_opt, learning_rate=learning_rate,
+            )
+            early_stop_patience = self.model_settings.get("hyperparameter_optimization_early_stopping_patience", 10)
+            early_stop = EarlyStopping(monitor='val_loss', patience=early_stop_patience, restore_best_weights=True, verbose=0)
+
+            history = model.fit(
+                X_train_opt, y_train_opt, epochs=epochs_opt, batch_size=batch_size,
+                validation_data=(X_val_opt, y_val_opt), callbacks=[early_stop], verbose=0
+            )
+            val_loss = min(history.history.get('val_loss', [float('inf')]))
+            del model, history; gc.collect() # メモリ解放
+            return val_loss
+
+        sampler = optuna.samplers.TPESampler(seed=self.seed) # シード固定
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        try:
+            # n_jobs > 1 はTensorFlow/Kerasと競合することがあるので注意。デフォルト1。
+            study.optimize(objective, n_trials=n_trials_actual, n_jobs=1, show_progress_bar=True)
+        except Exception as e:
+            self.logger.error(f"Optuna最適化中にエラー: {e}", exc_info=True)
+            return self.best_params # 既存のパラメータを返す
+
+        self.best_params = study.best_params
+        self.logger.info(f"Optuna最適化完了。最適パラメータ ({target_ticker}): {self.best_params}, 最小検証損失: {study.best_value:.6f}")
+        self.save_best_params(self.best_params)
+
+        duration_ms_opt = (datetime.now() - start_time_opt).total_seconds() * 1000
+        self.logger_manager.log_performance(
+            f"hyperparameter_optimization_{target_ticker}",
+            {
+                "n_trials_run": n_trials_actual,
+                "best_params_found": study.best_params,
+                "best_value_val_loss": study.best_value,
+                "duration_ms": round(duration_ms_opt, 2)
+            }
+        )
+        return self.best_params
+
+
+    def train_models_for_sp500(self, market_data_dict: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        self.logger.info("S&P500 LSTMモデル群の学習処理開始...")
+        start_time_train_all = datetime.now()
+        target_ticker = "^GSPC"
+        trained_models_output: Dict[str, Dict[str, Any]] = {}
+
+        df_sp500 = market_data_dict.get(target_ticker, {}).get("df")
+        if df_sp500 is None or df_sp500.empty:
+            self.logger.error(f"{target_ticker} のDataFrameが見つからないか空です。モデル学習中止。")
+            return trained_models_output
+
+        scaled_data_sp500, scaler_sp500, scaled_cols_sp500, original_indices_sp500 = self._prepare_data_for_lstm(df_sp500, target_ticker)
+        if scaled_data_sp500 is None or scaler_sp500 is None or not scaled_cols_sp500 or original_indices_sp500 is None:
+            self.logger.error(f"{target_ticker}: LSTM用データ準備失敗。モデル学習中止。")
+            return trained_models_output
+
+        # market_data_dictにスケーラー情報を保存 (可視化やアドバイザーで使うため)
+        market_data_dict[target_ticker]["scaler"] = scaler_sp500
+        market_data_dict[target_ticker]["scaled_columns"] = scaled_cols_sp500
+        market_data_dict[target_ticker]["scaled_data_index"] = original_indices_sp500
+
+
+        model_definitions = self.model_settings.get("sp500_prediction_model_configs", {})
+        if not model_definitions:
+            self.logger.warning("S&P500モデル定義 (sp500_prediction_model_configs) が設定にありません。学習スキップ。")
+            return trained_models_output
+
+        for model_name, params_def in model_definitions.items():
+            self.logger.info(f"--- '{model_name}'モデル ({target_ticker}) の学習開始 ---")
+            start_time_train_model = datetime.now()
+
+            time_step = params_def["input_time_steps"]
+            predict_step = params_def["prediction_horizon_days"]
+
+            X_all, y_all = self.create_multivariate_dataset(scaled_data_sp500, time_step, predict_step)
+            if X_all.shape[0] == 0:
+                self.logger.error(f"{model_name} ({target_ticker}): データセット作成失敗。スキップ。")
+                continue
+
+            train_ratio = self.model_settings.get("train_test_split_ratio", 0.8)
+            X_train, X_test, y_train, y_test = self._split_train_test(X_all, y_all, train_ratio=train_ratio)
+            if X_train.shape[0] == 0 or X_test.shape[0] == 0:
+                 self.logger.error(f"{model_name} ({target_ticker}): 訓練/テストデータ空。スキップ。")
+                 continue
+
+            # パラメータ設定 (Optuna優先)
+            cfg_lstm_units = params_def.get("lstm_units_per_layer")
+            cfg_dropout = params_def.get("lstm_dropout_rate")
+            cfg_lr = params_def.get("learning_rate") # モデル定義になければNone
+            cfg_batch_size = params_def.get("training_batch_size")
+            cfg_epochs = params_def.get("training_epochs")
+            cfg_n_layers = params_def.get("lstm_layers_count",1)
+
+            if params_def.get("use_optuna_params", False) and self.best_params:
+                self.logger.info(f"'{model_name}'モデルにOptuna最適化パラメータを使用: {self.best_params}")
+                final_lstm_units = self.best_params.get('lstm_units', cfg_lstm_units)
+                final_dropout = self.best_params.get('dropout_rate', cfg_dropout)
+                final_lr = self.best_params.get('learning_rate', cfg_lr) # OptunaでLRも最適化した場合
+                final_batch_size = self.best_params.get('batch_size', cfg_batch_size)
+                # epochsはOptuna対象外ならモデル定義の値を使用
+                final_n_layers = self.best_params.get('n_lstm_layers', cfg_n_layers)
+            else: # Optuna不使用またはパラメータなし
+                final_lstm_units, final_dropout, final_lr, final_batch_size, final_n_layers = \
+                    cfg_lstm_units, cfg_dropout, cfg_lr, cfg_batch_size, cfg_n_layers
+
+            if not all([final_lstm_units, final_dropout is not None, final_batch_size, cfg_epochs, final_n_layers]): # LRはNone許容
+                self.logger.error(f"'{model_name}'パラメータ不足。スキップ。Units:{final_lstm_units}, Dropout:{final_dropout}, Batch:{final_batch_size}, Epochs:{cfg_epochs}, Layers:{final_n_layers}")
+                continue
+
+            model = self._build_model(
+                input_shape=(X_train.shape[1], X_train.shape[2]),
+                lstm_units=final_lstm_units, n_lstm_layers=final_n_layers, dropout_rate=final_dropout,
+                predict_step=predict_step, learning_rate=final_lr
+            )
+            early_stop_patience_train = self.model_settings.get("model_training_early_stopping_patience", 15)
+            early_stop = EarlyStopping(monitor='val_loss', patience=early_stop_patience_train, restore_best_weights=True, verbose=1)
+
+            history = model.fit(
+                X_train, y_train, epochs=cfg_epochs, batch_size=final_batch_size,
+                validation_data=(X_test, y_test), callbacks=[early_stop], verbose=1
+            )
+            training_duration_model_ms = (datetime.now() - start_time_train_model).total_seconds() * 1000
+
+            y_pred_scaled_test = model.predict(X_test)
+            # 逆変換 (y_test, y_pred_scaled_test ともに (samples, predict_step) の形状を想定)
+            y_pred_original_test = self._inverse_transform_predictions(scaler_sp500, y_pred_scaled_test, len(scaled_cols_sp500))
+            y_test_original_test = self._inverse_transform_predictions(scaler_sp500, y_test, len(scaled_cols_sp500))
+
+            epsilon = 1e-8 # MAPE計算時のゼロ除算防止
+            mape_test = np.mean(np.abs((y_test_original_test - y_pred_original_test) / (y_test_original_test + epsilon))) * 100
+            self.logger.info(f"'{model_name}'モデル ({target_ticker}) 学習完了。テストMAPE: {mape_test:.2f}%")
+
+            # 最新データでの予測
+            latest_input_sequence_scaled = scaled_data_sp500[-time_step:]
+            latest_prediction_original = np.full(predict_step, np.nan) # デフォルトはNaN
+            if len(latest_input_sequence_scaled) == time_step:
+                latest_pred_scaled = model.predict(np.expand_dims(latest_input_sequence_scaled, axis=0))
+                latest_prediction_original = self._inverse_transform_predictions(scaler_sp500, latest_pred_scaled, len(scaled_cols_sp500)).flatten()
+            else:
+                self.logger.warning(f"'{model_name}' 最新予測用データ不足 ({len(latest_input_sequence_scaled)}/{time_step})。予測スキップ。")
+
+            # テストデータのインデックス特定 (プロット用)
+            # X_testの元になったデータのインデックス範囲 (original_indices_sp500 を使用)
+            # X_allは scaled_data から作られている。X_testはX_allの後半。
+            # y_testの最初の要素は、scaled_data[train_size + time_step] の predict_step 後に対応
+            test_start_original_idx_pos = len(X_train) # X_trainのサンプル数
+            # y_testに対応する元データのインデックス
+            # y_testの各要素は predict_step 日間の予測なので、最初の日のインデックスを代表とする
+            test_indices_for_y = original_indices_sp500[test_start_original_idx_pos + time_step : test_start_original_idx_pos + time_step + len(y_test)]
+
+
+            trained_models_output[model_name] = {
+                "model": model, # 保存はパスで行い、ここではオブジェクトを直接持たない方がメモリ効率良い場合も
+                "model_name_used": model_name, # for saving
+                "y_pred_original_test": y_pred_original_test,
+                "y_test_original_test": y_test_original_test, # y_testのプロット用インデックスも必要
+                "test_data_indices_for_plot": test_indices_for_y,
+                "mape_test": mape_test,
+                "latest_prediction_original": latest_prediction_original,
+                "last_actual_data_date_for_latest_pred": original_indices_sp500[-1], # 最新予測の基準日
+                "predict_step": predict_step,
+                "time_step_used": time_step,
+                "training_params": {
+                    "lstm_units": final_lstm_units, "n_lstm_layers": final_n_layers,
+                    "dropout_rate": final_dropout, "learning_rate": (
+    model.optimizer.learning_rate.numpy().item()
+    if hasattr(model.optimizer, "learning_rate") and hasattr(model.optimizer.learning_rate, "numpy")
+    else model.optimizer.learning_rate if hasattr(model.optimizer, "learning_rate")
+    else 'N/A'
+),
+                    "batch_size": final_batch_size, "epochs_trained": len(history.history['loss']),
+                    "duration_ms": round(training_duration_model_ms,2)
+                }
+            }
+
+            model_save_path_template = self.model_settings.get("model_save_path_template", "models/model_{ticker}_{name}.keras")
+            model_save_path = model_save_path_template.format(ticker=target_ticker.replace("^",""), name=model_name)
+            try:
+                save_dir = os.path.dirname(model_save_path)
+                if save_dir and not os.path.exists(save_dir): os.makedirs(save_dir)
+                save_model(model, model_save_path, save_format="keras") # .keras形式で保存
+                self.logger.info(f"'{model_name}'モデル ({target_ticker}) を '{model_save_path}' に保存。")
+            except Exception as e:
+                self.logger.error(f"モデル保存エラー ({model_save_path}): {e}", exc_info=True)
+
+            # パフォーマンスログ
+            perf_log_entry = trained_models_output[model_name]["training_params"].copy()
+            perf_log_entry["mape_test"] = mape_test
+            self.logger_manager.log_performance(f"train_model_{target_ticker}_{model_name}", perf_log_entry)
+            gc.collect()
+
+        self.logger.info(f"S&P500 LSTMモデル群の学習処理完了。総所要時間: {(datetime.now() - start_time_train_all).total_seconds():.2f}秒")
+        return trained_models_output
+
