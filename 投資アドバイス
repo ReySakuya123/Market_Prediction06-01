@@ -369,23 +369,26 @@ class InvestmentAdvisor:
             self.logger.error(f"{model_type} AI予測計算エラー: {e}")
             return 0.0, 0.5
 
-    def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """AI予測のサマリーを取得（修正版）"""
-        predictions = {}
-        errors = {}
+    from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """AI予測のサマリーを取得（キャッシュ版）"""
+    predictions = {}
+    errors = {}
+    
+    try:
+        self.logger.info("=== AI予測サマリー生成開始（キャッシュ版） ===")
         
-        try:
-            self.logger.info("=== AI予測サマリー生成開始（修正版） ===")
+        # 各モデルの結果を個別に処理
+        for model_key, model_result in self.trained_models_results.items():
+            if not isinstance(model_result, dict):
+                continue
             
-            # 各モデルの結果を個別に処理
-            for model_key, model_result in self.trained_models_results.items():
-                if not isinstance(model_result, dict):
-                    continue
-                
-                self.logger.info(f"処理中のモデル: {model_key}")
-                
-                # AI予測を計算
-                trend_pct, confidence = self._calculate_ai_prediction_from_model_data(model_result, model_key)
+            self.logger.debug(f"処理中のモデル: {model_key}") # INFOからDEBUGに変更
+            
+            # AI予測を計算
+            trend_pct, confidence = self._calculate_ai_prediction_from_model_data(model_result, model_key)
                 
                 # MAPE取得
                 mape = model_result.get('mape_test', 50)
