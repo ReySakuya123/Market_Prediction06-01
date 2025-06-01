@@ -533,7 +533,7 @@ class InvestmentAdvisor:
                 
                 # Avoid division by zero for RS
                 rs = gain / loss.replace(0, np.nan) # Replace 0 loss with NaN to avoid inf/nan issues in RS
-                rs = rs.fillna(method='ffill').fillna(0) # Fill NaNs in RS, e.g., if loss was 0 for a period
+                rs = rs.ffill().fillna(0) # Fill NaNs in RS, e.g., if loss was 0 for a period
                 
                 rsi = 100 - (100 / (1 + rs))
                 if not rsi.dropna().empty:
