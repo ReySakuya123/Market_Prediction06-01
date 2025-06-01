@@ -1,0 +1,162 @@
+
+class FeatureEngineering:
+    """特徴量エンジニアリングクラス"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        # 設定からテクニカル指標のパラメータを取得
+        self.fe_settings = config.get("feature_engineering_settings", {})
+        self.indicators_to_add = self.fe_settings.get("technical_indicators_to_add", [])
+        self.ma_windows = self.fe_settings.get("ma_windows", [5, 20, 60, 120])
+        self.rsi_window = self.fe_settings.get("rsi_window", 14)
+        self.bb_window = self.fe_settings.get("bb_window", 20)
+        self.bb_std_dev = self.fe_settings.get("bb_std_dev", 2)
+        self.atr_window = self.fe_settings.get("atr_window", 14)
+        self.macd_fast = self.fe_settings.get("macd_fast_period", 12)
+        self.macd_slow = self.fe_settings.get("macd_slow_period", 26)
+        self.macd_sign = self.fe_settings.get("macd_signal_period", 9)
+
+        self.rsi_oversold = 30 # 固定値またはconfigから
+        self.rsi_overbought = 70
+
+    def _ensure_required_columns(self, df: pd.DataFrame, required_cols: List[str]) -> bool:
+        """DataFrameに必要な列が存在するか確認し、なければ警告"""
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            self.logger.warning(f"テクニカル指標計算に必要な列が不足しています: {missing_cols}。該当指標の計算をスキップします。")
+            return False
+        return True
+
+    def _add_moving_averages(self, df: pd.DataFrame) -> None:
+        if "MA" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        for window in self.ma_windows:
+            if len(close) >= window:
+                df[f"MA{window}"] = ta.trend.sma_indicator(close, window=window, fillna=False) # fillna=Falseでtaライブラリのデフォルト挙動
+            else:
+                df[f"MA{window}"] = np.nan
+                self.logger.debug(f"MA{window} 計算スキップ: データ長 ({len(close)}) < ウィンドウ ({window})")
+
+    def _add_cross_signals(self, df: pd.DataFrame) -> None:
+        if "CrossSignals" not in self.indicators_to_add or not self._ensure_required_columns(df, ["MA5", "MA20"]): # MA5, MA20を仮定
+            # MA5, MA20がなければ、ma_windowsの最初の2つを使うなどのロジックも可能
+            # self.logger.debug("MA5またはMA20が存在しないため、クロスシグナル計算をスキップします。")
+            return
+
+        # 短期MAと中期MAを特定 (ma_windowsから)
+        if len(self.ma_windows) >= 2:
+            short_ma_col = f"MA{self.ma_windows[0]}"
+            mid_ma_col = f"MA{self.ma_windows[1]}"
+            if short_ma_col in df.columns and mid_ma_col in df.columns:
+                df["golden_cross"] = (df[short_ma_col] > df[mid_ma_col]) & (df[short_ma_col].shift(1) <= df[mid_ma_col].shift(1))
+                df["death_cross"] = (df[short_ma_col] < df[mid_ma_col]) & (df[short_ma_col].shift(1) >= df[mid_ma_col].shift(1))
+            else:
+                self.logger.debug(f"{short_ma_col} または {mid_ma_col} がDataFrameにないため、クロスシグナル計算をスキップ。")
+                df["golden_cross"] = False
+                df["death_cross"] = False
+        else:
+            df["golden_cross"] = False
+            df["death_cross"] = False
+
+
+    def _add_rsi(self, df: pd.DataFrame) -> None:
+        if "RSI" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        if len(close) >= self.rsi_window:
+            rsi_indicator = ta.momentum.RSIIndicator(close, window=self.rsi_window, fillna=False)
+            df["RSI"] = rsi_indicator.rsi()
+            # クロスシグナル (価格が閾値をクロスした瞬間)
+            df["RSI_buy_signal"] = (df["RSI"] < self.rsi_oversold) & (df["RSI"].shift(1) >= self.rsi_oversold)
+            df["RSI_sell_signal"] = (df["RSI"] > self.rsi_overbought) & (df["RSI"].shift(1) <= self.rsi_overbought)
+            # 状態シグナル (現在閾値を超えているか)
+            df["RSI_oversold"] = df["RSI"] < self.rsi_oversold
+            df["RSI_overbought"] = df["RSI"] > self.rsi_overbought
+        else:
+            for col in ["RSI", "RSI_buy_signal", "RSI_sell_signal", "RSI_oversold", "RSI_overbought"]: df[col] = np.nan
+            self.logger.debug(f"RSI 計算スキップ: データ長 ({len(close)}) < ウィンドウ ({self.rsi_window})")
+
+
+    def _add_macd(self, df: pd.DataFrame) -> None:
+        if "MACD" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        min_len_macd = max(self.macd_fast, self.macd_slow, self.macd_sign) # MACD計算に必要な最小期間
+        if len(close) >= min_len_macd:
+            macd_indicator = ta.trend.MACD(close, window_slow=self.macd_slow, window_fast=self.macd_fast, window_sign=self.macd_sign, fillna=False)
+            df["MACD"] = macd_indicator.macd()
+            df["MACD_signal"] = macd_indicator.macd_signal()
+            df["MACD_diff"] = macd_indicator.macd_diff() # ヒストグラム
+            # MACDクロスシグナル
+            df["MACD_buy_signal"] = (df["MACD"] > df["MACD_signal"]) & (df["MACD"].shift(1) <= df["MACD_signal"].shift(1))
+            df["MACD_sell_signal"] = (df["MACD"] < df["MACD_signal"]) & (df["MACD"].shift(1) >= df["MACD_signal"].shift(1))
+        else:
+            for col in ["MACD", "MACD_signal", "MACD_diff", "MACD_buy_signal", "MACD_sell_signal"]: df[col] = np.nan
+            self.logger.debug(f"MACD 計算スキップ: データ長 ({len(close)}) < 最小必要期間 ({min_len_macd})")
+
+
+    def _add_bollinger_bands(self, df: pd.DataFrame) -> None:
+        if "BB" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        if len(close) >= self.bb_window:
+            bollinger_indicator = ta.volatility.BollingerBands(close, window=self.bb_window, window_dev=self.bb_std_dev, fillna=False)
+            df["BB_High"] = bollinger_indicator.bollinger_hband()
+            df["BB_Mid"] = bollinger_indicator.bollinger_mavg()
+            df["BB_Low"] = bollinger_indicator.bollinger_lband()
+            df["BB_Width"] = bollinger_indicator.bollinger_wband() # バンド幅
+            df["BB_Percent"] = bollinger_indicator.bollinger_pband() # %B
+            # BBクロス/タッチシグナル
+            df["BB_buy_signal"] = (close < df["BB_Low"]) & (close.shift(1) >= df["BB_Low"].shift(1)) # 下抜けクロス
+            df["BB_sell_signal"] = (close > df["BB_High"]) & (close.shift(1) <= df["BB_High"].shift(1)) # 上抜けクロス
+        else:
+            for col in ["BB_High", "BB_Mid", "BB_Low", "BB_Width", "BB_Percent", "BB_buy_signal", "BB_sell_signal"]: df[col] = np.nan
+            self.logger.debug(f"BB 計算スキップ: データ長 ({len(close)}) < ウィンドウ ({self.bb_window})")
+
+
+    def _add_atr(self, df: pd.DataFrame) -> None:
+        if "ATR" not in self.indicators_to_add or not self._ensure_required_columns(df, ["High", "Low", "Close"]):
+            return
+        if len(df) >= self.atr_window: # ATRはDataFrame全体の長さ
+            atr_indicator = ta.volatility.AverageTrueRange(
+                high=df["High"], low=df["Low"], close=df["Close"],
+                window=self.atr_window, fillna=False
+            )
+            df["ATR"] = atr_indicator.average_true_range()
+        else:
+            df["ATR"] = np.nan
+            self.logger.debug(f"ATR 計算スキップ: データ長 ({len(df)}) < ウィンドウ ({self.atr_window})")
+
+
+    def add_technical_indicators(self, market_data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        self.logger.info("テクニカル指標の計算処理開始...")
+        for ticker_symbol, data_entry in market_data.items():
+            df = data_entry.get("df")
+            if df is None or df.empty:
+                self.logger.warning(f"{ticker_symbol}: DataFrameが存在しないか空のため、テクニカル指標計算をスキップ。")
+                continue
+
+            self.logger.info(f"--- {ticker_symbol}: テクニカル指標計算開始 ---")
+            df_with_ta = df.copy() # 元のDataFrameを変更しない
+
+            # 各指標計算メソッドを呼び出し
+            self._add_moving_averages(df_with_ta)
+            self._add_cross_signals(df_with_ta) # MA計算後に呼び出す
+            self._add_rsi(df_with_ta)
+            self._add_macd(df_with_ta)
+            self._add_bollinger_bands(df_with_ta)
+            self._add_atr(df_with_ta)
+            # 他の指標も同様に追加
+
+            # fillna(method='bfill') で先頭のNaNを後方の値で埋める (オプション)
+            # LSTM入力前には結局dropnaするので、ここでは積極的なNaN埋めは必須ではない
+            # df_with_ta.fillna(method='bfill', inplace=True)
+
+            market_data[ticker_symbol]["df"] = df_with_ta
+            self.logger.info(f"{ticker_symbol}: テクニカル指標計算完了。DataFrame 行数: {len(df_with_ta)}")
+
+        self.logger.info("全ティッカーのテクニカル指標計算処理完了。")
+        return market_data
+
