@@ -1,4 +1,3 @@
-
 class LSTMModel:
     """LSTMモデル訓練と予測クラス"""
 
@@ -24,7 +23,7 @@ class LSTMModel:
         random.seed(self.seed)
         np.random.seed(self.seed)
         tf.random.set_seed(self.seed)
-        if optuna: # optunaがインポートされていれば、その乱数シードも設定
+        if 'optuna' in globals() and optuna: # optunaがインポートされていれば、その乱数シードも設定
             # TPESamplerのseedはStudy作成時に指定
             pass
         self.logger.debug(f"乱数シードを {self.seed} に設定しました。")
@@ -335,7 +334,15 @@ class LSTMModel:
             self.logger.info(f"--- '{model_name}'モデル ({target_ticker}) の学習開始 ---")
             start_time_train_model = datetime.now()
 
-            time_step = params_def["input_time_steps"]
+            base_time_step = self.model_settings.get("unified_time_step", 60)
+            # --- インデント修正ここから ---
+            time_step = params_def.get("input_time_steps", base_time_step)
+
+            # 極端に異なるtime_stepの警告
+            if abs(time_step - base_time_step) > 20:
+                self.logger.warning(f"'{model_name}'のtime_step({time_step})が基準値({base_time_step})と大きく異なります。予測一貫性に影響する可能性があります。")
+                time_step = base_time_step  # 強制的に統一
+            # --- インデント修正ここまで ---
             predict_step = params_def["prediction_horizon_days"]
 
             X_all, y_all = self.create_multivariate_dataset(scaled_data_sp500, time_step, predict_step)
@@ -418,22 +425,22 @@ class LSTMModel:
             trained_models_output[model_name] = {
                 "model": model, # 保存はパスで行い、ここではオブジェクトを直接持たない方がメモリ効率良い場合も
                 "model_name_used": model_name, # for saving
-                "y_pred_original_test": y_pred_original_test,
-                "y_test_original_test": y_test_original_test, # y_testのプロット用インデックスも必要
-                "test_data_indices_for_plot": test_indices_for_y,
+                "y_pred_original_test": y_pred_original_test.tolist(), # JSONシリアライズのためリストに変換
+                "y_test_original_test": y_test_original_test.tolist(), # JSONシリアライズのためリストに変換
+                "test_data_indices_for_plot": test_indices_for_y.tolist() if isinstance(test_indices_for_y, pd.Index) else test_indices_for_y, # リストに変換
                 "mape_test": mape_test,
-                "latest_prediction_original": latest_prediction_original,
-                "last_actual_data_date_for_latest_pred": original_indices_sp500[-1], # 最新予測の基準日
+                "latest_prediction_original": latest_prediction_original.tolist(), # JSONシリアライズのためリストに変換
+                "last_actual_data_date_for_latest_pred": original_indices_sp500[-1].isoformat() if isinstance(original_indices_sp500[-1], pd.Timestamp) else original_indices_sp500[-1], # ISO形式に変換
                 "predict_step": predict_step,
                 "time_step_used": time_step,
                 "training_params": {
                     "lstm_units": final_lstm_units, "n_lstm_layers": final_n_layers,
                     "dropout_rate": final_dropout, "learning_rate": (
-    model.optimizer.learning_rate.numpy().item()
-    if hasattr(model.optimizer, "learning_rate") and hasattr(model.optimizer.learning_rate, "numpy")
-    else model.optimizer.learning_rate if hasattr(model.optimizer, "learning_rate")
-    else 'N/A'
-),
+                        model.optimizer.learning_rate.numpy().item()
+                        if hasattr(model.optimizer, "learning_rate") and hasattr(model.optimizer.learning_rate, "numpy")
+                        else model.optimizer.learning_rate if hasattr(model.optimizer, "learning_rate")
+                        else 'N/A'
+                    ),
                     "batch_size": final_batch_size, "epochs_trained": len(history.history['loss']),
                     "duration_ms": round(training_duration_model_ms,2)
                 }
@@ -444,7 +451,7 @@ class LSTMModel:
             try:
                 save_dir = os.path.dirname(model_save_path)
                 if save_dir and not os.path.exists(save_dir): os.makedirs(save_dir)
-                save_model(model, model_save_path)
+                save_model(model, model_save_path) # tensorflow.keras.models.save_model を使用
                 self.logger.info(f"'{model_name}'モデル ({target_ticker}) を '{model_save_path}' に保存。")
             except Exception as e:
                 self.logger.error(f"モデル保存エラー ({model_save_path}): {e}", exc_info=True)
@@ -457,4 +464,3 @@ class LSTMModel:
 
         self.logger.info(f"S&P500 LSTMモデル群の学習処理完了。総所要時間: {(datetime.now() - start_time_train_all).total_seconds():.2f}秒")
         return trained_models_output
-
