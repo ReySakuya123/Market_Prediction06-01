@@ -1,0 +1,177 @@
+
+class MarketVisualizer:
+    """市場データと予測の可視化クラス"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.viz_settings = config.get("visualization_settings", {})
+        self.plot_days = self.viz_settings.get("plot_recent_days_count", 365)
+        self.save_filename_template = self.viz_settings.get("plot_save_filename_template", "market_prediction_{ticker}.png")
+        self.download_dir_candidates = self.viz_settings.get("plot_download_directory_candidates", ["Downloads", "ダウンロード", "."])
+        self.dpi = self.viz_settings.get("plot_image_dpi", 300)
+        self.ma_windows_plot = self.config.get("feature_engineering_settings.ma_windows", [5,20,60,120]) # FE設定から取得
+
+    def _determine_save_path(self, ticker_symbol: str) -> str:
+        home_dir = os.path.expanduser("~")
+        filename = self.save_filename_template.format(ticker=ticker_symbol.replace("^",""))
+        for dir_candidate in self.download_dir_candidates:
+            candidate_path = os.path.join(home_dir, dir_candidate)
+            if os.path.isdir(candidate_path):
+                return os.path.join(candidate_path, filename)
+        # 適切な候補ディレクトリが見つからなければカレントワーキングディレクトリに保存
+        return os.path.join(os.getcwd(), filename)
+
+    def plot_predictions_for_sp500(
+        self, market_data_dict: Dict[str, Dict[str, Any]],
+        trained_models_results: Dict[str, Dict[str, Any]]
+    ) -> Optional[str]:
+        target_ticker = "^GSPC"
+        self.logger.info(f"グラフ作成開始 ({target_ticker})...")
+
+        market_entry = market_data_dict.get(target_ticker)
+        if not market_entry or "df" not in market_entry or market_entry["df"].empty:
+            self.logger.error(f"{target_ticker}: 市場データなし。グラフ作成中止。")
+            return None
+        df_sp500 = market_entry["df"]
+        ticker_name = market_entry.get("name", target_ticker)
+
+        # サブプロット数 (価格+短期予測+テスト予測, 価格+MA, 相関)
+        num_subplots = 3
+        fig, axes = plt.subplots(num_subplots, 1, figsize=(18, 6 * num_subplots), sharex=False)
+        plt.style.use('seaborn-v0_8-darkgrid') # スタイルの適用 (v0.8以降の推奨名)
+
+        plot_successful = False
+        try:
+            df_plot_recent = df_sp500.tail(self.plot_days).copy()
+
+            # 1. 価格と短期予測、テスト期間の予測もプロット
+            short_model_key = "short" # configの `sp500_prediction_model_configs` のキーと合わせる
+            self._plot_price_and_predictions(
+                axes[0], df_plot_recent, trained_models_results.get(short_model_key),
+                target_ticker, ticker_name, model_label_suffix=f"({short_model_key.capitalize()}-Term)"
+            )
+
+            # 2. 価格と移動平均線、クロスシグナル
+            self._plot_price_and_moving_avg(axes[1], df_plot_recent, target_ticker, ticker_name)
+
+            # 3. 相関ヒートマップ
+            corr_cols = self.viz_settings.get("correlation_matrix_features", [])
+            self._plot_correlation_heatmap(axes[2], df_plot_recent, target_ticker, ticker_name, corr_cols)
+
+            fig.suptitle(f"{ticker_name} ({target_ticker}) 市場分析と予測 ({datetime.now().strftime('%Y-%m-%d')})", fontsize=20, y=1.01)
+            plt.tight_layout(rect=[0, 0.02, 1, 0.99]) # rectでタイトルとの間隔調整
+            plot_successful = True
+
+        except Exception as e:
+            self.logger.error(f"グラフ描画中にエラー発生 ({target_ticker}): {e}", exc_info=True)
+        finally:
+            if plot_successful:
+                save_path = self._determine_save_path(target_ticker)
+                try:
+                    plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
+                    self.logger.info(f"グラフを'{save_path}'に保存しました。")
+                    plt.close(fig) # 保存後閉じる
+                    return save_path
+                except Exception as e_save:
+                    self.logger.error(f"グラフ保存失敗 ({save_path}): {e_save}", exc_info=True)
+            if 'fig' in locals(): plt.close(fig) # 何かあれば必ず閉じる
+        return None
+
+    def _plot_price_and_predictions(self, ax: Axes, df_plot_base: pd.DataFrame,
+                                    model_result: Optional[Dict[str, Any]],
+                                    ticker_symbol: str, ticker_name: str, model_label_suffix: str = "") -> None:
+        ax.plot(df_plot_base.index, df_plot_base["Close"], label=f"実績値 ({ticker_name})", color='dodgerblue', lw=1.8, alpha=0.8)
+
+        title = f"{ticker_name} 価格"
+        if model_result:
+            predict_step = model_result.get("predict_step", 0)
+            time_step_model = model_result.get("time_step_used", 0)
+            mape = model_result.get("mape_test", float('nan'))
+            title += f" と LSTM {predict_step}日間予測 {model_label_suffix} (MAPE: {mape:.2f}%)"
+
+            # テスト期間の予測プロット
+            y_test_orig = model_result.get("y_test_original_test")
+            y_pred_orig_test = model_result.get("y_pred_original_test")
+            test_indices = model_result.get("test_data_indices_for_plot")
+
+            if y_test_orig is not None and y_pred_orig_test is not None and test_indices is not None and len(test_indices) == len(y_test_orig):
+                # y_test_orig, y_pred_orig_test は (num_samples, predict_step) の形状
+                # ここでは最初の予測ステップ (翌日予測に相当) のみをプロットする
+                # 全ステッププロットは複雑になるので別途検討
+                ax.plot(test_indices, y_pred_orig_test[:, 0], label=f"テスト期間予測 (LSTM {model_label_suffix.strip()})", color='darkorange', linestyle='-.', lw=1.5, alpha=0.9)
+
+            # 最新の予測プロット
+            latest_pred = model_result.get("latest_prediction_original")
+            if latest_pred is not None and len(latest_pred) > 0:
+                last_actual_date = model_result.get("last_actual_data_date_for_latest_pred", df_plot_base.index[-1])
+                # 予測期間のインデックス (元のDFのfreqを考慮)
+                freq = pd.infer_freq(df_plot_base.index) or 'B' # B: 営業日
+                pred_index_future = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=len(latest_pred), freq=freq)
+
+                ax.plot(pred_index_future, latest_pred, label=f"最新予測 (LSTM {model_label_suffix.strip()})", color='tomato', linestyle='--', marker='o', markersize=4, lw=1.8)
+                # 実績の最終値と予測の開始値を結ぶ
+                ax.plot([last_actual_date, pred_index_future[0]],
+                        [df_plot_base.loc[last_actual_date, "Close"] if last_actual_date in df_plot_base.index else df_plot_base["Close"].iloc[-1], latest_pred[0]],
+                        linestyle=':', color='dimgray', alpha=0.7)
+        else:
+            title += " (予測データなし)"
+
+        ax.set_title(title, fontsize=14)
+        ax.set_ylabel("価格", fontsize=12)
+        ax.legend(fontsize=10, loc='upper left')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        from matplotlib.dates import DateFormatter, MonthLocator
+        ax.xaxis.set_major_formatter(DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_locator(MonthLocator(interval=max(1, len(df_plot_base)//150))) # X軸ラベル数を調整
+        ax.tick_params(axis='x', rotation=30)
+
+    def _plot_price_and_moving_avg(self, ax: Axes, df_plot_base: pd.DataFrame, ticker_symbol: str, ticker_name: str) -> None:
+        ax.plot(df_plot_base.index, df_plot_base["Close"], label=f"実績値 ({ticker_name})", color='dodgerblue', lw=1.8, alpha=0.8)
+        ma_colors = ['darkorange', 'forestgreen', 'mediumpurple', 'sienna']
+
+        for i, window in enumerate(self.ma_windows_plot):
+            ma_col = f"MA{window}"
+            if ma_col in df_plot_base.columns:
+                ax.plot(df_plot_base.index, df_plot_base[ma_col], label=f"MA{window}", color=ma_colors[i % len(ma_colors)], lw=1.2, alpha=0.9)
+
+        # クロスシグナルのプロット
+        short_ma_col = f"MA{self.ma_windows_plot[0]}" if self.ma_windows_plot else None
+        if "golden_cross" in df_plot_base.columns and short_ma_col and short_ma_col in df_plot_base.columns:
+            gc_points = df_plot_base[df_plot_base["golden_cross"]]
+            if not gc_points.empty:
+                ax.scatter(gc_points.index, gc_points[short_ma_col], label="Golden Cross", marker='^', color='gold', s=120, edgecolor='black', zorder=10)
+        if "death_cross" in df_plot_base.columns and short_ma_col and short_ma_col in df_plot_base.columns:
+            dc_points = df_plot_base[df_plot_base["death_cross"]]
+            if not dc_points.empty:
+                ax.scatter(dc_points.index, dc_points[short_ma_col], label="Death Cross", marker='v', color='crimson', s=120, edgecolor='black', zorder=10)
+
+        ax.set_title(f"{ticker_name} 価格と移動平均線", fontsize=14)
+        ax.set_ylabel("価格", fontsize=12)
+        ax.legend(fontsize=10, loc='upper left')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        from matplotlib.dates import DateFormatter, MonthLocator
+        ax.xaxis.set_major_formatter(DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_locator(MonthLocator(interval=max(1, len(df_plot_base)//150)))
+        ax.tick_params(axis='x', rotation=30)
+
+    def _plot_correlation_heatmap(self, ax: Axes, df_plot_base: pd.DataFrame, ticker_symbol: str, ticker_name: str, corr_columns: List[str]) -> None:
+        available_cols = [col for col in corr_columns if col in df_plot_base.columns and df_plot_base[col].nunique(dropna=True) > 1]
+        if len(available_cols) < 2:
+            ax.text(0.5, 0.5, "相関分析に十分な列がありません", ha='center', va='center', fontsize=12, transform=ax.transAxes)
+            ax.set_title(f'{ticker_name} 相関ヒートマップ (データ不足)', fontsize=14)
+            ax.axis('off')
+            return
+
+        corr_matrix = df_plot_base[available_cols].corr()
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm_r', fmt=".2f", vmin=-1, vmax=1,
+                    linewidths=.5, cbar=True, ax=ax, annot_kws={"size": 9}, square=True)
+        ax.set_title(f'{ticker_name} 主要指標の相関 (過去{self.plot_days}日間)', fontsize=14)
+        
+        # 修正: tick_params から ha パラメータを削除し、別途設定
+        ax.tick_params(axis='x', rotation=45, labelsize=10)
+        ax.tick_params(axis='y', rotation=0, labelsize=10)
+        
+        # X軸ラベルの水平配置を個別に設定
+        for label in ax.get_xticklabels():
+            label.set_horizontalalignment('right')
