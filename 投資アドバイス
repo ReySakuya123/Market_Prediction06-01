@@ -701,8 +701,11 @@ class InvestmentAdvisor:
             sell_score = tech_signals.get("total_sell_score", 0)
 
             # テクニカルとAI予測の統合（重み付け改善）
-            # Example: If AI is bullish but tech is strongly bearish, moderate the trend
-            if trend_label == "bullish" and sell_score > buy_score + 2: # Tech strongly disagrees
+            final_trend, final_confidence = self._resolve_prediction_conflicts(
+    trend, final_trend, buy_score, sell_score, final_confidence
+)
+trend = final_trend
+
                 # AI予測が大幅下落の場合はより慎重に
                 if final_trend < -5: # If underlying AI trend was actually bearish despite label
                     trend_label = "bearish"
