@@ -1,10 +1,10 @@
-
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from dataclasses import dataclass
 import json
+from functools import lru_cache # import文を先頭に移動
 
 @dataclass
 class MarketAssessment:
@@ -369,32 +369,30 @@ class InvestmentAdvisor:
             self.logger.error(f"{model_type} AI予測計算エラー: {e}")
             return 0.0, 0.5
 
-    from functools import lru_cache
-
-@lru_cache(maxsize=1)
-def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """AI予測のサマリーを取得（キャッシュ版）"""
-    predictions = {}
-    errors = {}
-    
-    try:
-        self.logger.info("=== AI予測サマリー生成開始（キャッシュ版） ===")
+    @lru_cache(maxsize=1)
+    def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """AI予測のサマリーを取得（キャッシュ版）"""
+        predictions = {}
+        errors = {}
         
-        # 各モデルの結果を個別に処理
-        for model_key, model_result in self.trained_models_results.items():
-            if not isinstance(model_result, dict):
-                continue
+        try:
+            self.logger.info("=== AI予測サマリー生成開始（キャッシュ版） ===")
             
-            self.logger.debug(f"処理中のモデル: {model_key}") # INFOからDEBUGに変更
-            
-            # AI予測を計算
-            trend_pct, confidence = self._calculate_ai_prediction_from_model_data(model_result, model_key)
+            # 各モデルの結果を個別に処理
+            for model_key, model_result in self.trained_models_results.items():
+                if not isinstance(model_result, dict):
+                    continue
                 
-                # MAPE取得
+                self.logger.debug(f"処理中のモデル: {model_key}") # INFOからDEBUGに変更
+                
+                # AI予測を計算
+                trend_pct, confidence = self._calculate_ai_prediction_from_model_data(model_result, model_key)
+                
+                # MAPE取得 (インデント修正)
                 mape = model_result.get('mape_test', 50)
                 errors[f"{model_key}_mape"] = mape
                 
-                # モデルタイプ別に分類
+                # モデルタイプ別に分類 (インデント修正)
                 if 'long' in model_key.lower():
                     predictions["long_term"] = {"trend_pct": trend_pct, "confidence": confidence}
                 elif 'short' in model_key.lower():
@@ -405,13 +403,13 @@ def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
                     # デフォルトは長期として扱う
                     predictions["long_term"] = {"trend_pct": trend_pct, "confidence": confidence}
             
-            # 予測が空の場合の処理
+            # 予測が空の場合の処理 (インデント修正 - forループの外)
             if not predictions.get("long_term"):
                 # 最も信頼できるモデルから長期予測を生成
                 best_model = None
                 best_mape = float('inf')
                 
-                for model_key, model_result in self.trained_models_results.items():
+                for model_key, model_result in self.trained_models_results.items(): # このループは再度全モデルをチェック
                     if isinstance(model_result, dict) and 'mape_test' in model_result:
                         mape = model_result.get('mape_test', 100)
                         if mape < best_mape:
@@ -425,8 +423,8 @@ def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
                     predictions["long_term"] = {"trend_pct": trend_pct, "confidence": confidence}
                     self.logger.info(f"最良モデル {best_model} から長期予測生成: {trend_pct:.2f}%")
             
-            self.logger.info(f"最終的なAI予測: {predictions}")
-            return predictions, errors
+            self.logger.info(f"最終的なAI予測: {predictions}") # (インデント修正 - forループの外)
+            return predictions, errors # (インデント修正 - forループの外)
             
         except Exception as e:
             self.logger.error(f"AI予測サマリー取得エラー: {e}")
@@ -1140,4 +1138,3 @@ def _get_ai_predictions_summary(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
         
         validation["overall_valid"] = all(validation.values())
         return validation
-
