@@ -1,0 +1,177 @@
+import os
+import gc
+import warnings
+import subprocess
+import importlib
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, Tuple, List, Type, Union # Union を追加
+import json
+import logging
+import time
+import random # LSTMModelのset_random_seedで使用
+
+# 必要な外部ライブラリのインストール＆インポート
+def install_and_import(package_name: str, import_name: str = None, version_spec: Optional[str] = None):
+    """
+    パッケージをインストール（存在しない場合）してインポートする。
+    バージョン指定も可能。
+    """
+    import_name = import_name or package_name
+    try:
+        module = importlib.import_module(import_name)
+        # バージョンチェック (オプション)
+        if version_spec and hasattr(module, '__version__'):
+            from packaging.requirements import Requirement
+            from packaging.version import parse as parse_version
+            req = Requirement(f"{package_name}{version_spec}")
+            if not req.specifier.contains(parse_version(module.__version__)):
+                raise ImportError(f"{package_name}のバージョンが要求({version_spec})と異なります: {module.__version__}")
+        return module
+    except ImportError:
+        package_to_install = package_name
+        if version_spec:
+            package_to_install += version_spec
+        print(f"'{package_to_install}' をインストールしています...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_to_install]) # sys.executable を使用
+            return importlib.import_module(import_name)
+        except subprocess.CalledProcessError as e:
+            print(f"'{package_to_install}' のインストールに失敗しました: {e}")
+            raise
+        except Exception as e: # インポート後の予期せぬエラー
+            print(f"'{import_name}' のインポート中にエラーが発生しました: {e}")
+            raise
+
+# --- 外部ライブラリのインポート ---
+# ログ出力はLoggerManager初期化後に行うため、ここではprintを使用
+try:
+    import sys # install_and_importで使用
+    np = install_and_import("numpy")
+    pd = install_and_import("pandas")
+    plt = install_and_import("matplotlib", "matplotlib.pyplot")
+    from matplotlib.axes import Axes
+    sns = install_and_import("seaborn")
+    sklearn_preprocessing = install_and_import("scikit-learn", "sklearn.preprocessing") # パッケージ名修正
+    MinMaxScaler = sklearn_preprocessing.MinMaxScaler
+    stats = install_and_import("scipy").stats
+    ta = install_and_import("ta")
+    optuna = install_and_import("optuna")
+    tf = install_and_import("tensorflow")
+    from tensorflow.keras.models import Sequential, save_model, load_model
+    from tensorflow.keras.layers import LSTM, Dropout, Dense
+    from tensorflow.keras.callbacks import EarlyStopping
+    from tensorflow.keras.optimizers import Adam as KerasAdam # Adamを明示的にインポート
+except ImportError as e:
+    print(f"必須ライブラリのインポート/インストールに失敗しました: {e}. プログラムを終了します。")
+    sys.exit(1) # 致命的なエラーとして終了
+except Exception as e: # その他の予期せぬエラー
+    print(f"ライブラリ初期化中に予期せぬエラー: {e}. プログラムを終了します。")
+    sys.exit(1)
+
+
+warnings.filterwarnings('ignore', category=FutureWarning) # TensorFlow等のFutureWarningを抑制
+warnings.filterwarnings('ignore', category=UserWarning)   # Seaborn等のUserWarningを抑制
+
+# --- CurlSession の条件付きエイリアス定義 ---
+CurlSession: Optional[Type[Union[Any, Any]]] = None # requests.Session or curl_cffi.requests.Session
+# Union[requests.Session, curl_cffi.requests.Session] のように具体的な型を書くのが理想だが、
+# インポート失敗時のために Any も許容。None の可能性もあるため Optional
+try:
+    from curl_cffi.requests import Session as CurlCffiSession
+    CurlSession = CurlCffiSession
+    print("INFO: curl_cffi.requests.Session を CurlSession として使用します。")
+except ImportError:
+    try:
+        from requests import Session as RequestsSession
+        CurlSession = RequestsSession
+        print("INFO: requests.Session を CurlSession として使用します (curl_cffi が見つかりませんでした)。")
+    except ImportError:
+        print("WARNING: curl_cffi と requests のどちらも見つかりませんでした。HTTPリクエスト機能が制限されます。")
+        # CurlSession は None のまま
+
+
+class LoggerManager:
+    """ロギング管理クラス"""
+    LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(process)d - %(threadName)s - %(message)s'
+
+    def __init__(self, log_level: int = logging.INFO, log_file: Optional[str] = None):
+        self.loggers: Dict[str, logging.Logger] = {}
+        self.log_level = log_level
+        self.log_file = log_file
+        self.performance_log: List[Dict[str, Any]] = []
+        self._setup_root_logger()
+
+    def _setup_root_logger(self):
+        """ルートロガーの基本的な設定。basicConfigは一度だけ呼び出されるべき。"""
+        # 既にハンドラが設定されているか確認
+        root_logger = logging.getLogger()
+        if not root_logger.hasHandlers():
+            handlers = []
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(logging.Formatter(self.LOG_FORMAT))
+            handlers.append(stream_handler)
+
+            if self.log_file:
+                try:
+                    file_handler = logging.FileHandler(self.log_file, encoding='utf-8')
+                    file_handler.setFormatter(logging.Formatter(self.LOG_FORMAT))
+                    handlers.append(file_handler)
+                except IOError as e:
+                    print(f"ログファイル '{self.log_file}' のオープンに失敗: {e}. ファイルログは無効になります。")
+
+            logging.basicConfig(level=self.log_level, handlers=handlers)
+            # 外部ライブラリのログレベルを制御 (例: TensorFlow, matplotlib)
+            logging.getLogger('tensorflow').setLevel(logging.WARNING)
+            logging.getLogger('matplotlib').setLevel(logging.WARNING)
+            logging.getLogger('h5py').setLevel(logging.WARNING)
+            # print(f"ルートロガーを設定しました。レベル: {logging.getLevelName(self.log_level)}")
+        else:
+            # ルートロガーが既に設定済みの場合、レベルのみ調整 (必要であれば)
+            root_logger.setLevel(self.log_level)
+            # print(f"ルートロガーは既に設定済みです。レベルを {logging.getLevelName(self.log_level)} に調整しました。")
+            pass
+
+
+    def get_logger(self, name: str) -> logging.Logger:
+        if name in self.loggers:
+            return self.loggers[name]
+
+        logger = logging.getLogger(name)
+        # このマネージャーのログレベルを個々のロガーにも設定
+        # (ルートロガーのレベルより詳細なログを個別に出せるようにするため)
+        logger.setLevel(self.log_level)
+
+        # ハンドラが重複しないように、このマネージャーでは個別のロガーにハンドラを追加しない
+        # 親ロガー(最終的にはルートロガー)に伝播させることで、ルートのハンドラで処理
+        logger.propagate = True
+
+        self.loggers[name] = logger
+        return logger
+
+    def log_performance(self, operation: str, metrics: Dict[str, Any]) -> None:
+        entry = metrics.copy()
+        entry['timestamp'] = datetime.now().isoformat()
+        entry['operation'] = operation
+        self.performance_log.append(entry)
+
+    def save_performance_log(self, filename: str = "performance_log.json") -> None:
+        # パフォーマンスログは必ずJSONファイルに保存する
+        if not self.performance_log:
+            # self.get_logger(self.__class__.__name__).info("保存するパフォーマンスログがありません。")
+            return
+
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(self.performance_log, f, indent=2, ensure_ascii=False)
+            self.get_logger(self.__class__.__name__).info(f"パフォーマンスログを '{filename}' に保存しました。")
+        except IOError as e:
+            self.get_logger(self.__class__.__name__).error(f"パフォーマンスログ保存エラー ({filename}): {e}")
+        except Exception as e: # その他の予期せぬエラー
+            self.get_logger(self.__class__.__name__).error(f"パフォーマンスログ保存中に予期せぬエラー: {e}", exc_info=True)
+
+
+# --- アプリケーション全体で共有するLoggerManagerインスタンス ---
+# main.py のようなエントリーポイントで一度だけ初期化するのが理想
+# ここではグローバルスコープに置くが、依存性注入(DI)の方が望ましい
+APP_LOGGER_MANAGER = LoggerManager(log_level=logging.INFO, log_file="market_system.log")
+
