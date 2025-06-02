@@ -1,0 +1,970 @@
+class FeatureEngineering:
+    """特徴量エンジニアリングクラス"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        # 設定からテクニカル指標のパラメータを取得
+        self.fe_settings = config.get("feature_engineering_settings", {})
+        self.indicators_to_add = self.fe_settings.get("technical_indicators_to_add", [])
+        self.ma_windows = self.fe_settings.get("ma_windows", [5, 20, 60, 120])
+        self.rsi_window = self.fe_settings.get("rsi_window", 14)
+        self.bb_window = self.fe_settings.get("bb_window", 20)
+        self.bb_std_dev = self.fe_settings.get("bb_std_dev", 2)
+        self.atr_window = self.fe_settings.get("atr_window", 14)
+        self.macd_fast = self.fe_settings.get("macd_fast_period", 12)
+        self.macd_slow = self.fe_settings.get("macd_slow_period", 26)
+        self.macd_sign = self.fe_settings.get("macd_signal_period", 9)
+
+        self.rsi_oversold = 30 # 固定値またはconfigから
+        self.rsi_overbought = 70
+
+    def _ensure_required_columns(self, df: pd.DataFrame, required_cols: List[str]) -> bool:
+        """DataFrameに必要な列が存在するか確認し、なければ警告"""
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            self.logger.warning(f"テクニカル指標計算に必要な列が不足しています: {missing_cols}。該当指標の計算をスキップします。")
+            return False
+        return True
+
+    def _add_moving_averages(self, df: pd.DataFrame) -> None:
+        if "MA" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        for window in self.ma_windows:
+            if len(close) >= window:
+                df[f"MA{window}"] = ta.trend.sma_indicator(close, window=window, fillna=False) # fillna=Falseでtaライブラリのデフォルト挙動
+            else:
+                df[f"MA{window}"] = np.nan
+                self.logger.debug(f"MA{window} 計算スキップ: データ長 ({len(close)}) < ウィンドウ ({window})")
+
+    def _add_cross_signals(self, df: pd.DataFrame) -> None:
+        if "CrossSignals" not in self.indicators_to_add or not self._ensure_required_columns(df, ["MA5", "MA20"]): # MA5, MA20を仮定
+            # MA5, MA20がなければ、ma_windowsの最初の2つを使うなどのロジックも可能
+            # self.logger.debug("MA5またはMA20が存在しないため、クロスシグナル計算をスキップします。")
+            return
+
+        # 短期MAと中期MAを特定 (ma_windowsから)
+        if len(self.ma_windows) >= 2:
+            short_ma_col = f"MA{self.ma_windows[0]}"
+            mid_ma_col = f"MA{self.ma_windows[1]}"
+            if short_ma_col in df.columns and mid_ma_col in df.columns:
+                df["golden_cross"] = (df[short_ma_col] > df[mid_ma_col]) & (df[short_ma_col].shift(1) <= df[mid_ma_col].shift(1))
+                df["death_cross"] = (df[short_ma_col] < df[mid_ma_col]) & (df[short_ma_col].shift(1) >= df[mid_ma_col].shift(1))
+            else:
+                self.logger.debug(f"{short_ma_col} または {mid_ma_col} がDataFrameにないため、クロスシグナル計算をスキップ。")
+                df["golden_cross"] = False
+                df["death_cross"] = False
+        else:
+            df["golden_cross"] = False
+            df["death_cross"] = False
+
+
+    def _add_rsi(self, df: pd.DataFrame) -> None:
+        if "RSI" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        if len(close) >= self.rsi_window:
+            rsi_indicator = ta.momentum.RSIIndicator(close, window=self.rsi_window, fillna=False)
+            df["RSI"] = rsi_indicator.rsi()
+            # クロスシグナル (価格が閾値をクロスした瞬間)
+            df["RSI_buy_signal"] = (df["RSI"] < self.rsi_oversold) & (df["RSI"].shift(1) >= self.rsi_oversold)
+            df["RSI_sell_signal"] = (df["RSI"] > self.rsi_overbought) & (df["RSI"].shift(1) <= self.rsi_overbought)
+            # 状態シグナル (現在閾値を超えているか)
+            df["RSI_oversold"] = df["RSI"] < self.rsi_oversold
+            df["RSI_overbought"] = df["RSI"] > self.rsi_overbought
+        else:
+            for col in ["RSI", "RSI_buy_signal", "RSI_sell_signal", "RSI_oversold", "RSI_overbought"]: df[col] = np.nan
+            self.logger.debug(f"RSI 計算スキップ: データ長 ({len(close)}) < ウィンドウ ({self.rsi_window})")
+
+
+    def _add_macd(self, df: pd.DataFrame) -> None:
+        if "MACD" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        min_len_macd = max(self.macd_fast, self.macd_slow, self.macd_sign) # MACD計算に必要な最小期間
+        if len(close) >= min_len_macd:
+            macd_indicator = ta.trend.MACD(close, window_slow=self.macd_slow, window_fast=self.macd_fast, window_sign=self.macd_sign, fillna=False)
+            df["MACD"] = macd_indicator.macd()
+            df["MACD_signal"] = macd_indicator.macd_signal()
+            df["MACD_diff"] = macd_indicator.macd_diff() # ヒストグラム
+            # MACDクロスシグナル
+            df["MACD_buy_signal"] = (df["MACD"] > df["MACD_signal"]) & (df["MACD"].shift(1) <= df["MACD_signal"].shift(1))
+            df["MACD_sell_signal"] = (df["MACD"] < df["MACD_signal"]) & (df["MACD"].shift(1) >= df["MACD_signal"].shift(1))
+        else:
+            for col in ["MACD", "MACD_signal", "MACD_diff", "MACD_buy_signal", "MACD_sell_signal"]: df[col] = np.nan
+            self.logger.debug(f"MACD 計算スキップ: データ長 ({len(close)}) < 最小必要期間 ({min_len_macd})")
+
+
+    def _add_bollinger_bands(self, df: pd.DataFrame) -> None:
+        if "BB" not in self.indicators_to_add or not self._ensure_required_columns(df, ["Close"]):
+            return
+        close = df["Close"]
+        if len(close) >= self.bb_window:
+            bollinger_indicator = ta.volatility.BollingerBands(close, window=self.bb_window, window_dev=self.bb_std_dev, fillna=False)
+            df["BB_High"] = bollinger_indicator.bollinger_hband()
+            df["BB_Mid"] = bollinger_indicator.bollinger_mavg()
+            df["BB_Low"] = bollinger_indicator.bollinger_lband()
+            df["BB_Width"] = bollinger_indicator.bollinger_wband() # バンド幅
+            df["BB_Percent"] = bollinger_indicator.bollinger_pband() # %B
+            # BBクロス/タッチシグナル
+            df["BB_buy_signal"] = (close < df["BB_Low"]) & (close.shift(1) >= df["BB_Low"].shift(1)) # 下抜けクロス
+            df["BB_sell_signal"] = (close > df["BB_High"]) & (close.shift(1) <= df["BB_High"].shift(1)) # 上抜けクロス
+        else:
+            for col in ["BB_High", "BB_Mid", "BB_Low", "BB_Width", "BB_Percent", "BB_buy_signal", "BB_sell_signal"]: df[col] = np.nan
+            self.logger.debug(f"BB 計算スキップ: データ長 ({len(close)}) < ウィンドウ ({self.bb_window})")
+
+
+    def _add_atr(self, df: pd.DataFrame) -> None:
+        if "ATR" not in self.indicators_to_add or not self._ensure_required_columns(df, ["High", "Low", "Close"]):
+            return
+        if len(df) >= self.atr_window: # ATRはDataFrame全体の長さ
+            atr_indicator = ta.volatility.AverageTrueRange(
+                high=df["High"], low=df["Low"], close=df["Close"],
+                window=self.atr_window, fillna=False
+            )
+            df["ATR"] = atr_indicator.average_true_range()
+        else:
+            df["ATR"] = np.nan
+            self.logger.debug(f"ATR 計算スキップ: データ長 ({len(df)}) < ウィンドウ ({self.atr_window})")
+
+
+    def add_technical_indicators(self, market_data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        self.logger.info("テクニカル指標の計算処理開始...")
+        for ticker_symbol, data_entry in market_data.items():
+            df = data_entry.get("df")
+            if df is None or df.empty:
+                self.logger.warning(f"{ticker_symbol}: DataFrameが存在しないか空のため、テクニカル指標計算をスキップ。")
+                continue
+
+            self.logger.info(f"--- {ticker_symbol}: テクニカル指標計算開始 ---")
+            df_with_ta = df.copy() # 元のDataFrameを変更しない
+
+            # 各指標計算メソッドを呼び出し
+            self._add_moving_averages(df_with_ta)
+            self._add_cross_signals(df_with_ta) # MA計算後に呼び出す
+            self._add_rsi(df_with_ta)
+            self._add_macd(df_with_ta)
+            self._add_bollinger_bands(df_with_ta)
+            self._add_atr(df_with_ta)
+            # 他の指標も同様に追加
+
+            # fillna(method='bfill') で先頭のNaNを後方の値で埋める (オプション)
+            # LSTM入力前には結局dropnaするので、ここでは積極的なNaN埋めは必須ではない
+            # df_with_ta.fillna(method='bfill', inplace=True)
+
+            market_data[ticker_symbol]["df"] = df_with_ta
+            self.logger.info(f"{ticker_symbol}: テクニカル指標計算完了。DataFrame 行数: {len(df_with_ta)}")
+
+        self.logger.info("全ティッカーのテクニカル指標計算処理完了。")
+        return market_data
+
+
+class LSTMModel:
+    """LSTMモデル訓練と予測クラス"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.logger_manager = logger_manager # パフォーマンスログ用
+
+        self.model_settings = config.get("model_training_settings", {})
+        self.opt_settings = config.get("hyperparameter_optimization_settings", {})
+
+        self.seed = self.model_settings.get("random_seed", 42)
+        self.set_random_seed()
+
+        self.best_params: Optional[Dict[str, Any]] = None
+        self.hyperparams_file = self.opt_settings.get("load_best_hyperparameters_file", "best_lstm_params.json")
+
+
+    def set_random_seed(self):
+        """各種ライブラリの乱数シードを設定する"""
+        os.environ['PYTHONHASHSEED'] = str(self.seed)
+        os.environ['TF_DETERMINISTIC_OPS'] = '1' # TFの決定論的動作 (可能な範囲で)
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        tf.random.set_seed(self.seed)
+        if optuna: # optunaがインポートされていれば、その乱数シードも設定
+            # TPESamplerのseedはStudy作成時に指定
+            pass
+        self.logger.debug(f"乱数シードを {self.seed} に設定しました。")
+
+
+    def load_best_params(self, filepath: Optional[str] = None) -> bool:
+        load_path = filepath or self.hyperparams_file
+        self.logger.info(f"最適化済みハイパーパラメータを '{load_path}' からロード試行...")
+        try:
+            with open(load_path, "r", encoding="utf-8") as f:
+                self.best_params = json.load(f)
+            self.logger.info(f"ハイパーパラメータをロードしました: {self.best_params}")
+            return True
+        except FileNotFoundError:
+            self.logger.info(f"ハイパーパラメータファイル '{load_path}' が見つかりません。")
+            self.best_params = None
+            return False
+        except json.JSONDecodeError as e:
+            self.logger.error(f"ハイパーパラメータファイル '{load_path}' のJSONパースエラー: {e}")
+            self.best_params = None
+            return False
+        except Exception as e:
+            self.logger.error(f"ハイパーパラメータファイル '{load_path}' のロード中に予期せぬエラー: {e}", exc_info=True)
+            self.best_params = None
+            return False
+
+    def save_best_params(self, params: Dict[str, Any], filepath: Optional[str] = None):
+        save_path = filepath or self.hyperparams_file
+        self.logger.info(f"最適ハイパーパラメータを '{save_path}' に保存試行...")
+        try:
+            # 保存先ディレクトリが存在しない場合は作成
+            save_dir = os.path.dirname(save_path)
+            if save_dir and not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+                self.logger.info(f"保存先ディレクトリを作成しました: {save_dir}")
+
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(params, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"最適ハイパーパラメータを '{save_path}' に保存しました。")
+        except IOError as e:
+            self.logger.error(f"ハイパーパラメータのファイル保存IOエラー ({save_path}): {e}")
+        except Exception as e:
+            self.logger.error(f"ハイパーパラメータの保存中に予期せぬエラー ({save_path}): {e}", exc_info=True)
+
+
+    def _prepare_data_for_lstm(
+        self, df: pd.DataFrame, ticker_symbol: str
+    ) -> Tuple[Optional[np.ndarray], Optional[MinMaxScaler], Optional[List[str]], Optional[pd.Index]]:
+        """DataFrameからLSTMモデル用のスケーリング済み多変量データを準備する。スケーリングに使ったインデックスも返す。"""
+        self.logger.debug(f"{ticker_symbol}: LSTM用データ準備開始...")
+
+        # スケーリング対象列 (S&P500の場合のみ特別扱い、他はCloseのみなど柔軟に)
+        if ticker_symbol == "^GSPC":
+            potential_cols = self.model_settings.get("lstm_input_columns_for_gspc", ["^GSPC", "VIX", "^DJI"])
+        else: # 他のティッカーは自身の終値のみ、または設定で指定
+            potential_cols = [ticker_symbol] # configで指定できるようにしても良い
+
+        cols_for_scaling = [col for col in potential_cols if col in df.columns and df[col].isnull().sum() < len(df)] # 全てNaNの列は除外
+        if not cols_for_scaling or ticker_symbol not in cols_for_scaling: # ticker_symbol自体が含まれているか
+             # S&P500以外でティッカー名が 'Close' と異なる場合、ticker_symbolの代わりに 'Close' を探す
+            if ticker_symbol not in cols_for_scaling and 'Close' in df.columns:
+                cols_for_scaling = ['Close'] # 主対象をCloseとする
+                if 'VIX' in df.columns and self.config.get("feature_engineering_settings.use_vix_feature"):
+                    cols_for_scaling.append('VIX')
+            else:
+                self.logger.error(f"{ticker_symbol}: LSTM用データ準備エラー。スケーリング対象の主列が見つかりません。候補: {potential_cols}, 存在列: {list(df.columns)}")
+                return None, None, None, None
+
+        # 欠損値処理: LSTM入力前には欠損がない状態にする
+        # ここではdropnaするが、より高度な補完処理も検討可能 (例: ffill後bfill)
+        # df_processed = df[cols_for_scaling].fillna(method='ffill').fillna(method='bfill') # 先に補完
+        # data_to_scale = df_processed.dropna() # それでも残るNaNがあれば削除
+        data_to_scale = df[cols_for_scaling].dropna() # シンプルにdropna
+
+        if data_to_scale.empty:
+            self.logger.error(f"{ticker_symbol}: LSTM用データ準備エラー。dropna後データが空になりました。対象列: {cols_for_scaling}")
+            return None, None, None, None
+
+        original_index = data_to_scale.index # スケーリングに使用したデータのインデックスを保持
+
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        try:
+            scaled_data = scaler.fit_transform(data_to_scale)
+        except Exception as e:
+            self.logger.error(f"{ticker_symbol}: データスケーリング中にエラー: {e}", exc_info=True)
+            return None, None, None, None
+
+        self.logger.info(f"{ticker_symbol}: LSTM用データ準備完了。スケーリング対象列: {cols_for_scaling}, スケーリング後形状: {scaled_data.shape}")
+        return scaled_data, scaler, cols_for_scaling, original_index
+
+
+    def create_multivariate_dataset(
+        self, data: np.ndarray, time_step: int, predict_step: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        X, y = [], []
+        if data.ndim == 1: data = data.reshape(-1, 1)
+
+        if len(data) <= time_step + predict_step -1: # データが足りない場合 (等号を含む)
+            self.logger.warning(f"データ長({len(data)})がtime_step({time_step}) + predict_step({predict_step})に対して不足。データセット作成不可。")
+            return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+        for i in range(len(data) - time_step - predict_step + 1):
+            X.append(data[i:(i + time_step), :])
+            y.append(data[i + time_step : i + time_step + predict_step, 0]) # 予測対象は常に最初の特徴量
+        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+    def _split_train_test(
+        self, X: np.ndarray, y: np.ndarray, train_ratio: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if len(X) == 0: return np.array([]), np.array([]), np.array([]), np.array([])
+        
+        train_size = int(len(X) * train_ratio)
+        # 訓練データ、テストデータが最低1サンプルは存在するように調整
+        if train_size <= 0 and len(X) > 1: train_size = 1 # 少なくとも1つは訓練
+        if train_size >= len(X) and len(X) > 1: train_size = len(X) - 1 # 少なくとも1つはテスト
+
+        if train_size == 0 and len(X) > 0 : # データが1つしかない場合など
+             self.logger.warning(f"データ数が非常に少ないため({len(X)}サンプル)、train_sizeが0。全てを訓練/テストデータとします。")
+             return X, X, y, y # 訓練とテストを同じにする（評価には不適切だが実行は可能）
+        if train_size == len(X):
+             self.logger.warning(f"データ数が非常に少ないため({len(X)}サンプル)、全て訓練データ。テストデータを複製します。")
+             return X, X, y, y
+
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+        return X_train, X_test, y_train, y_test
+
+
+    def _build_model(
+        self, input_shape: Tuple[int, int], lstm_units: int, dropout_rate: float,
+        predict_step: int, n_lstm_layers: int = 1, learning_rate: Optional[float] = None,
+    ) -> tf.keras.Model:
+        tf.keras.backend.clear_session() # モデル構築前にセッションクリア
+        self.set_random_seed() # 再現性のためにここでもシード設定
+
+        model = Sequential()
+        for i in range(n_lstm_layers):
+            return_sequences = True if i < n_lstm_layers - 1 else False # 最後のLSTM層以外はTrue
+            if i == 0: # 最初の層のみinput_shapeを指定
+                model.add(LSTM(lstm_units, return_sequences=return_sequences, input_shape=input_shape))
+            else:
+                model.add(LSTM(lstm_units, return_sequences=return_sequences))
+            model.add(Dropout(dropout_rate))
+
+        model.add(Dense(predict_step)) # 出力層: 予測ステップ数分のユニット
+
+        optimizer_name = self.model_settings.get("default_optimizer_algorithm", "adam").lower()
+        final_learning_rate = learning_rate if learning_rate is not None else self.model_settings.get("default_learning_rate", 0.001)
+
+        if optimizer_name == "adam":
+            optimizer = KerasAdam(learning_rate=final_learning_rate) # tensorflow.keras.optimizers.Adam を使用
+        else: # 他のオプティマイザ (例: RMSprop)
+            self.logger.warning(f"オプティマイザ '{optimizer_name}' はAdam以外未実装です。Adam (lr={final_learning_rate}) を使用します。")
+            optimizer = KerasAdam(learning_rate=final_learning_rate)
+
+        loss_function = self.model_settings.get("default_loss_function", 'mean_squared_error')
+        model.compile(optimizer=optimizer, loss=loss_function)
+        # self.logger.debug(f"モデル構築完了: LSTM層={n_lstm_layers}, Units={lstm_units}, Dropout={dropout_rate}, LR={final_learning_rate}, Loss={loss_function}")
+        # model.summary(print_fn=self.logger.debug) # ログにサマリ出力
+        return model
+
+
+    def _inverse_transform_predictions(
+        self, scaler: MinMaxScaler, predictions: np.ndarray, num_scaled_features: int
+    ) -> np.ndarray:
+        if predictions.ndim == 1: predictions = predictions.reshape(-1, 1)
+        if predictions.shape[1] > 1 and predictions.shape[1] != num_scaled_features :
+             # 複数ステップ予測の場合、predictionsは(samples, predict_steps)
+             # 逆変換は各ステップごとに行う必要がある
+             # ここでは、予測対象は常に最初の特徴量であると仮定している
+             inverted_preds_list = []
+             for step_idx in range(predictions.shape[1]): # 各予測ステップに対して
+                dummy_step_pred = np.zeros((predictions.shape[0], num_scaled_features))
+                dummy_step_pred[:, 0] = predictions[:, step_idx]
+                inverted_step = scaler.inverse_transform(dummy_step_pred)[:, 0]
+                inverted_preds_list.append(inverted_step)
+             return np.array(inverted_preds_list).T # (samples, predict_steps) に転置
+
+        # 1ステップ予測または1特徴量予測の場合
+        dummy_predictions = np.zeros((predictions.shape[0], num_scaled_features))
+        dummy_predictions[:, 0] = predictions[:, 0] # 予測値を最初の列に配置
+        try:
+            original_scale_predictions_full = scaler.inverse_transform(dummy_predictions)
+            return original_scale_predictions_full[:, 0].reshape(-1, 1) # 最初の列のみ返す
+        except ValueError as ve: # スケーラーの特徴量数と合わない場合など
+            self.logger.error(f"逆変換エラー: {ve}. Scaler features: {getattr(scaler, 'n_features_in_', 'N/A')}, Preds shape for dummy: {dummy_predictions.shape}")
+            return predictions # エラー時はスケールされた値をそのまま返す
+        except Exception as e:
+            self.logger.error(f"予期せぬ逆変換エラー: {e}", exc_info=True)
+            return predictions
+
+    def optimize_hyperparameters(
+        self, market_data_dict: Dict[str, Dict[str, Any]], target_ticker: str = "^GSPC",
+        n_trials: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        self.logger.info(f"Optunaによるハイパーパラメータ最適化開始 (対象: {target_ticker})")
+        start_time_opt = datetime.now()
+
+        n_trials_actual = n_trials if n_trials is not None else self.opt_settings.get("default_optuna_trials", 50)
+        if n_trials_actual <= 0:
+            self.logger.warning("Optuna試行回数が0以下です。最適化をスキップします。")
+            return self.best_params # 既存のパラメータを返すか、None
+
+        df_target = market_data_dict.get(target_ticker, {}).get("df")
+        if df_target is None or df_target.empty:
+            self.logger.error(f"最適化対象 {target_ticker} のDataFrameが見つからないか空です。最適化中止。")
+            return None
+
+        scaled_data, scaler, scaled_cols, _ = self._prepare_data_for_lstm(df_target, target_ticker)
+        if scaled_data is None or scaler is None or not scaled_cols:
+            self.logger.error(f"{target_ticker}: LSTM用データ準備失敗。最適化中止。")
+            return None
+
+        time_step_opt = self.model_settings.get("hyperparameter_optimization_time_steps", 60)
+        predict_step_opt = 1 # 翌日予測で最適化 (固定)
+
+        X_all, y_all = self.create_multivariate_dataset(scaled_data, time_step_opt, predict_step_opt)
+        if X_all.shape[0] == 0:
+            self.logger.error(f"{target_ticker}: Optuna用データセット作成失敗。データ不足の可能性。最適化中止。")
+            return None
+
+        train_ratio_opt = self.model_settings.get("train_test_split_ratio", 0.8)
+        X_train_opt, X_val_opt, y_train_opt, y_val_opt = self._split_train_test(X_all, y_all, train_ratio=train_ratio_opt)
+        if X_train_opt.shape[0] == 0 or X_val_opt.shape[0] == 0:
+            self.logger.error(f"{target_ticker}: Optuna用訓練/検証データが空。データ不足の可能性。最適化中止。")
+            return None
+
+        def objective(trial: optuna.Trial) -> float:
+            # ハイパーパラメータの提案範囲 (configから取得)
+            lstm_units = trial.suggest_categorical('lstm_units', self.opt_settings.get("optuna_lstm_units_choices", [64, 128]))
+            n_lstm_layers = trial.suggest_int('n_lstm_layers', *self.opt_settings.get("optuna_n_lstm_layers_range", [1,2]))
+            dropout_rate = trial.suggest_float('dropout_rate', *self.opt_settings.get("optuna_dropout_rate_range", [0.1, 0.5]))
+            learning_rate = trial.suggest_float('learning_rate', *self.opt_settings.get("optuna_learning_rate_range", [1e-4, 1e-2]), log=True)
+            batch_size = trial.suggest_categorical('batch_size', self.opt_settings.get("optuna_batch_size_choices", [32, 64]))
+            epochs_opt = self.model_settings.get("hyperparameter_optimization_epochs", 50)
+
+            model = self._build_model(
+                input_shape=(X_train_opt.shape[1], X_train_opt.shape[2]),
+                lstm_units=lstm_units, n_lstm_layers=n_lstm_layers, dropout_rate=dropout_rate,
+                predict_step=predict_step_opt, learning_rate=learning_rate,
+            )
+            early_stop_patience = self.model_settings.get("hyperparameter_optimization_early_stopping_patience", 10)
+            early_stop = EarlyStopping(monitor='val_loss', patience=early_stop_patience, restore_best_weights=True, verbose=0)
+
+            history = model.fit(
+                X_train_opt, y_train_opt, epochs=epochs_opt, batch_size=batch_size,
+                validation_data=(X_val_opt, y_val_opt), callbacks=[early_stop], verbose=0
+            )
+            val_loss = min(history.history.get('val_loss', [float('inf')]))
+            del model, history; gc.collect() # メモリ解放
+            return val_loss
+
+        sampler = optuna.samplers.TPESampler(seed=self.seed) # シード固定
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        try:
+            # n_jobs > 1 はTensorFlow/Kerasと競合することがあるので注意。デフォルト1。
+            study.optimize(objective, n_trials=n_trials_actual, n_jobs=1, show_progress_bar=True)
+        except Exception as e:
+            self.logger.error(f"Optuna最適化中にエラー: {e}", exc_info=True)
+            return self.best_params # 既存のパラメータを返す
+
+        self.best_params = study.best_params
+        self.logger.info(f"Optuna最適化完了。最適パラメータ ({target_ticker}): {self.best_params}, 最小検証損失: {study.best_value:.6f}")
+        self.save_best_params(self.best_params)
+
+        duration_ms_opt = (datetime.now() - start_time_opt).total_seconds() * 1000
+        self.logger_manager.log_performance(
+            f"hyperparameter_optimization_{target_ticker}",
+            {
+                "n_trials_run": n_trials_actual,
+                "best_params_found": study.best_params,
+                "best_value_val_loss": study.best_value,
+                "duration_ms": round(duration_ms_opt, 2)
+            }
+        )
+        return self.best_params
+
+
+    def train_models_for_sp500(self, market_data_dict: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        self.logger.info("S&P500 LSTMモデル群の学習処理開始...")
+        start_time_train_all = datetime.now()
+        target_ticker = "^GSPC"
+        trained_models_output: Dict[str, Dict[str, Any]] = {}
+
+        df_sp500 = market_data_dict.get(target_ticker, {}).get("df")
+        if df_sp500 is None or df_sp500.empty:
+            self.logger.error(f"{target_ticker} のDataFrameが見つからないか空です。モデル学習中止。")
+            return trained_models_output
+
+        scaled_data_sp500, scaler_sp500, scaled_cols_sp500, original_indices_sp500 = self._prepare_data_for_lstm(df_sp500, target_ticker)
+        if scaled_data_sp500 is None or scaler_sp500 is None or not scaled_cols_sp500 or original_indices_sp500 is None:
+            self.logger.error(f"{target_ticker}: LSTM用データ準備失敗。モデル学習中止。")
+            return trained_models_output
+
+        # market_data_dictにスケーラー情報を保存 (可視化やアドバイザーで使うため)
+        market_data_dict[target_ticker]["scaler"] = scaler_sp500
+        market_data_dict[target_ticker]["scaled_columns"] = scaled_cols_sp500
+        market_data_dict[target_ticker]["scaled_data_index"] = original_indices_sp500
+
+
+        model_definitions = self.model_settings.get("sp500_prediction_model_configs", {})
+        if not model_definitions:
+            self.logger.warning("S&P500モデル定義 (sp500_prediction_model_configs) が設定にありません。学習スキップ。")
+            return trained_models_output
+
+        for model_name, params_def in model_definitions.items():
+            self.logger.info(f"--- '{model_name}'モデル ({target_ticker}) の学習開始 ---")
+            start_time_train_model = datetime.now()
+
+            time_step = params_def["input_time_steps"]
+            predict_step = params_def["prediction_horizon_days"]
+
+            X_all, y_all = self.create_multivariate_dataset(scaled_data_sp500, time_step, predict_step)
+            if X_all.shape[0] == 0:
+                self.logger.error(f"{model_name} ({target_ticker}): データセット作成失敗。スキップ。")
+                continue
+
+            train_ratio = self.model_settings.get("train_test_split_ratio", 0.8)
+            X_train, X_test, y_train, y_test = self._split_train_test(X_all, y_all, train_ratio=train_ratio)
+            if X_train.shape[0] == 0 or X_test.shape[0] == 0:
+                 self.logger.error(f"{model_name} ({target_ticker}): 訓練/テストデータ空。スキップ。")
+                 continue
+
+            # パラメータ設定 (Optuna優先)
+            cfg_lstm_units = params_def.get("lstm_units_per_layer")
+            cfg_dropout = params_def.get("lstm_dropout_rate")
+            cfg_lr = params_def.get("learning_rate") # モデル定義になければNone
+            cfg_batch_size = params_def.get("training_batch_size")
+            cfg_epochs = params_def.get("training_epochs")
+            cfg_n_layers = params_def.get("lstm_layers_count",1)
+
+            if params_def.get("use_optuna_params", False) and self.best_params:
+                self.logger.info(f"'{model_name}'モデルにOptuna最適化パラメータを使用: {self.best_params}")
+                final_lstm_units = self.best_params.get('lstm_units', cfg_lstm_units)
+                final_dropout = self.best_params.get('dropout_rate', cfg_dropout)
+                final_lr = self.best_params.get('learning_rate', cfg_lr) # OptunaでLRも最適化した場合
+                final_batch_size = self.best_params.get('batch_size', cfg_batch_size)
+                # epochsはOptuna対象外ならモデル定義の値を使用
+                final_n_layers = self.best_params.get('n_lstm_layers', cfg_n_layers)
+            else: # Optuna不使用またはパラメータなし
+                final_lstm_units, final_dropout, final_lr, final_batch_size, final_n_layers = \
+                    cfg_lstm_units, cfg_dropout, cfg_lr, cfg_batch_size, cfg_n_layers
+
+            if not all([final_lstm_units, final_dropout is not None, final_batch_size, cfg_epochs, final_n_layers]): # LRはNone許容
+                self.logger.error(f"'{model_name}'パラメータ不足。スキップ。Units:{final_lstm_units}, Dropout:{final_dropout}, Batch:{final_batch_size}, Epochs:{cfg_epochs}, Layers:{final_n_layers}")
+                continue
+
+            model = self._build_model(
+                input_shape=(X_train.shape[1], X_train.shape[2]),
+                lstm_units=final_lstm_units, n_lstm_layers=final_n_layers, dropout_rate=final_dropout,
+                predict_step=predict_step, learning_rate=final_lr
+            )
+            early_stop_patience_train = self.model_settings.get("model_training_early_stopping_patience", 15)
+            early_stop = EarlyStopping(monitor='val_loss', patience=early_stop_patience_train, restore_best_weights=True, verbose=1)
+
+            history = model.fit(
+                X_train, y_train, epochs=cfg_epochs, batch_size=final_batch_size,
+                validation_data=(X_test, y_test), callbacks=[early_stop], verbose=1
+            )
+            training_duration_model_ms = (datetime.now() - start_time_train_model).total_seconds() * 1000
+
+            y_pred_scaled_test = model.predict(X_test)
+            # 逆変換 (y_test, y_pred_scaled_test ともに (samples, predict_step) の形状を想定)
+            y_pred_original_test = self._inverse_transform_predictions(scaler_sp500, y_pred_scaled_test, len(scaled_cols_sp500))
+            y_test_original_test = self._inverse_transform_predictions(scaler_sp500, y_test, len(scaled_cols_sp500))
+
+            epsilon = 1e-8 # MAPE計算時のゼロ除算防止
+            mape_test = np.mean(np.abs((y_test_original_test - y_pred_original_test) / (y_test_original_test + epsilon))) * 100
+            self.logger.info(f"'{model_name}'モデル ({target_ticker}) 学習完了。テストMAPE: {mape_test:.2f}%")
+
+            # 最新データでの予測
+            latest_input_sequence_scaled = scaled_data_sp500[-time_step:]
+            latest_prediction_original = np.full(predict_step, np.nan) # デフォルトはNaN
+            if len(latest_input_sequence_scaled) == time_step:
+                latest_pred_scaled = model.predict(np.expand_dims(latest_input_sequence_scaled, axis=0))
+                latest_prediction_original = self._inverse_transform_predictions(scaler_sp500, latest_pred_scaled, len(scaled_cols_sp500)).flatten()
+            else:
+                self.logger.warning(f"'{model_name}' 最新予測用データ不足 ({len(latest_input_sequence_scaled)}/{time_step})。予測スキップ。")
+
+            # テストデータのインデックス特定 (プロット用)
+            # X_testの元になったデータのインデックス範囲 (original_indices_sp500 を使用)
+            # X_allは scaled_data から作られている。X_testはX_allの後半。
+            # y_testの最初の要素は、scaled_data[train_size + time_step] の predict_step 後に対応
+            test_start_original_idx_pos = len(X_train) # X_trainのサンプル数
+            # y_testに対応する元データのインデックス
+            # y_testの各要素は predict_step 日間の予測なので、最初の日のインデックスを代表とする
+            test_indices_for_y = original_indices_sp500[test_start_original_idx_pos + time_step : test_start_original_idx_pos + time_step + len(y_test)]
+
+
+            trained_models_output[model_name] = {
+                "model": model, # 保存はパスで行い、ここではオブジェクトを直接持たない方がメモリ効率良い場合も
+                "model_name_used": model_name, # for saving
+                "y_pred_original_test": y_pred_original_test,
+                "y_test_original_test": y_test_original_test, # y_testのプロット用インデックスも必要
+                "test_data_indices_for_plot": test_indices_for_y,
+                "mape_test": mape_test,
+                "latest_prediction_original": latest_prediction_original,
+                "last_actual_data_date_for_latest_pred": original_indices_sp500[-1], # 最新予測の基準日
+                "predict_step": predict_step,
+                "time_step_used": time_step,
+                "training_params": {
+                    "lstm_units": final_lstm_units, "n_lstm_layers": final_n_layers,
+                    "dropout_rate": final_dropout, "learning_rate": (
+    model.optimizer.learning_rate.numpy().item()
+    if hasattr(model.optimizer, "learning_rate") and hasattr(model.optimizer.learning_rate, "numpy")
+    else model.optimizer.learning_rate if hasattr(model.optimizer, "learning_rate")
+    else 'N/A'
+),
+                    "batch_size": final_batch_size, "epochs_trained": len(history.history['loss']),
+                    "duration_ms": round(training_duration_model_ms,2)
+                }
+            }
+
+            model_save_path_template = self.model_settings.get("model_save_path_template", "models/model_{ticker}_{name}.keras")
+            model_save_path = model_save_path_template.format(ticker=target_ticker.replace("^",""), name=model_name)
+            try:
+                save_dir = os.path.dirname(model_save_path)
+                if save_dir and not os.path.exists(save_dir): os.makedirs(save_dir)
+                save_model(model, model_save_path)
+                self.logger.info(f"'{model_name}'モデル ({target_ticker}) を '{model_save_path}' に保存。")
+            except Exception as e:
+                self.logger.error(f"モデル保存エラー ({model_save_path}): {e}", exc_info=True)
+
+            # パフォーマンスログ
+            perf_log_entry = trained_models_output[model_name]["training_params"].copy()
+            perf_log_entry["mape_test"] = mape_test
+            self.logger_manager.log_performance(f"train_model_{target_ticker}_{model_name}", perf_log_entry)
+            gc.collect()
+
+        self.logger.info(f"S&P500 LSTMモデル群の学習処理完了。総所要時間: {(datetime.now() - start_time_train_all).total_seconds():.2f}秒")
+        return trained_models_output
+
+
+class MarketVisualizer:
+    """市場データと予測の可視化クラス"""
+
+    def __init__(self, config: 'Config', logger_manager: LoggerManager):
+        self.config = config
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.viz_settings = config.get("visualization_settings", {})
+        self.plot_days = self.viz_settings.get("plot_recent_days_count", 365)
+        self.save_filename_template = self.viz_settings.get("plot_save_filename_template", "market_prediction_{ticker}.png")
+        self.download_dir_candidates = self.viz_settings.get("plot_download_directory_candidates", ["Downloads", "ダウンロード", "."])
+        self.dpi = self.viz_settings.get("plot_image_dpi", 300)
+        self.ma_windows_plot = self.config.get("feature_engineering_settings.ma_windows", [5,20,60,120]) # FE設定から取得
+
+    def _determine_save_path(self, ticker_symbol: str) -> str:
+        home_dir = os.path.expanduser("~")
+        filename = self.save_filename_template.format(ticker=ticker_symbol.replace("^",""))
+        for dir_candidate in self.download_dir_candidates:
+            candidate_path = os.path.join(home_dir, dir_candidate)
+            if os.path.isdir(candidate_path):
+                return os.path.join(candidate_path, filename)
+        # 適切な候補ディレクトリが見つからなければカレントワーキングディレクトリに保存
+        return os.path.join(os.getcwd(), filename)
+
+    def plot_predictions_for_sp500(
+        self, market_data_dict: Dict[str, Dict[str, Any]],
+        trained_models_results: Dict[str, Dict[str, Any]]
+    ) -> Optional[str]:
+        target_ticker = "^GSPC"
+        self.logger.info(f"グラフ作成開始 ({target_ticker})...")
+
+        market_entry = market_data_dict.get(target_ticker)
+        if not market_entry or "df" not in market_entry or market_entry["df"].empty:
+            self.logger.error(f"{target_ticker}: 市場データなし。グラフ作成中止。")
+            return None
+        df_sp500 = market_entry["df"]
+        ticker_name = market_entry.get("name", target_ticker)
+
+        # サブプロット数 (価格+短期予測+テスト予測, 価格+MA, 相関)
+        num_subplots = 3
+        fig, axes = plt.subplots(num_subplots, 1, figsize=(18, 6 * num_subplots), sharex=False)
+        plt.style.use('seaborn-v0_8-darkgrid') # スタイルの適用 (v0.8以降の推奨名)
+
+        plot_successful = False
+        try:
+            df_plot_recent = df_sp500.tail(self.plot_days).copy()
+
+            # 1. 価格と短期予測、テスト期間の予測もプロット
+            short_model_key = "short" # configの `sp500_prediction_model_configs` のキーと合わせる
+            self._plot_price_and_predictions(
+                axes[0], df_plot_recent, trained_models_results.get(short_model_key),
+                target_ticker, ticker_name, model_label_suffix=f"({short_model_key.capitalize()}-Term)"
+            )
+
+            # 2. 価格と移動平均線、クロスシグナル
+            self._plot_price_and_moving_avg(axes[1], df_plot_recent, target_ticker, ticker_name)
+
+            # 3. 相関ヒートマップ
+            corr_cols = self.viz_settings.get("correlation_matrix_features", [])
+            self._plot_correlation_heatmap(axes[2], df_plot_recent, target_ticker, ticker_name, corr_cols)
+
+            fig.suptitle(f"{ticker_name} ({target_ticker}) 市場分析と予測 ({datetime.now().strftime('%Y-%m-%d')})", fontsize=20, y=1.01)
+            plt.tight_layout(rect=[0, 0.02, 1, 0.99]) # rectでタイトルとの間隔調整
+            plot_successful = True
+
+        except Exception as e:
+            self.logger.error(f"グラフ描画中にエラー発生 ({target_ticker}): {e}", exc_info=True)
+        finally:
+            if plot_successful:
+                save_path = self._determine_save_path(target_ticker)
+                try:
+                    plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
+                    self.logger.info(f"グラフを'{save_path}'に保存しました。")
+                    plt.close(fig) # 保存後閉じる
+                    return save_path
+                except Exception as e_save:
+                    self.logger.error(f"グラフ保存失敗 ({save_path}): {e_save}", exc_info=True)
+            if 'fig' in locals(): plt.close(fig) # 何かあれば必ず閉じる
+        return None
+
+    def _plot_price_and_predictions(self, ax: Axes, df_plot_base: pd.DataFrame,
+                                    model_result: Optional[Dict[str, Any]],
+                                    ticker_symbol: str, ticker_name: str, model_label_suffix: str = "") -> None:
+        ax.plot(df_plot_base.index, df_plot_base["Close"], label=f"実績値 ({ticker_name})", color='dodgerblue', lw=1.8, alpha=0.8)
+
+        title = f"{ticker_name} 価格"
+        if model_result:
+            predict_step = model_result.get("predict_step", 0)
+            time_step_model = model_result.get("time_step_used", 0)
+            mape = model_result.get("mape_test", float('nan'))
+            title += f" と LSTM {predict_step}日間予測 {model_label_suffix} (MAPE: {mape:.2f}%)"
+
+            # テスト期間の予測プロット
+            y_test_orig = model_result.get("y_test_original_test")
+            y_pred_orig_test = model_result.get("y_pred_original_test")
+            test_indices = model_result.get("test_data_indices_for_plot")
+
+            if y_test_orig is not None and y_pred_orig_test is not None and test_indices is not None and len(test_indices) == len(y_test_orig):
+                # y_test_orig, y_pred_orig_test は (num_samples, predict_step) の形状
+                # ここでは最初の予測ステップ (翌日予測に相当) のみをプロットする
+                # 全ステッププロットは複雑になるので別途検討
+                ax.plot(test_indices, y_pred_orig_test[:, 0], label=f"テスト期間予測 (LSTM {model_label_suffix.strip()})", color='darkorange', linestyle='-.', lw=1.5, alpha=0.9)
+
+            # 最新の予測プロット
+            latest_pred = model_result.get("latest_prediction_original")
+            if latest_pred is not None and len(latest_pred) > 0:
+                last_actual_date = model_result.get("last_actual_data_date_for_latest_pred", df_plot_base.index[-1])
+                # 予測期間のインデックス (元のDFのfreqを考慮)
+                freq = pd.infer_freq(df_plot_base.index) or 'B' # B: 営業日
+                pred_index_future = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=len(latest_pred), freq=freq)
+
+                ax.plot(pred_index_future, latest_pred, label=f"最新予測 (LSTM {model_label_suffix.strip()})", color='tomato', linestyle='--', marker='o', markersize=4, lw=1.8)
+                # 実績の最終値と予測の開始値を結ぶ
+                ax.plot([last_actual_date, pred_index_future[0]],
+                        [df_plot_base.loc[last_actual_date, "Close"] if last_actual_date in df_plot_base.index else df_plot_base["Close"].iloc[-1], latest_pred[0]],
+                        linestyle=':', color='dimgray', alpha=0.7)
+        else:
+            title += " (予測データなし)"
+
+        ax.set_title(title, fontsize=14)
+        ax.set_ylabel("価格", fontsize=12)
+        ax.legend(fontsize=10, loc='upper left')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        from matplotlib.dates import DateFormatter, MonthLocator
+        ax.xaxis.set_major_formatter(DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_locator(MonthLocator(interval=max(1, len(df_plot_base)//150))) # X軸ラベル数を調整
+        ax.tick_params(axis='x', rotation=30)
+
+    def _plot_price_and_moving_avg(self, ax: Axes, df_plot_base: pd.DataFrame, ticker_symbol: str, ticker_name: str) -> None:
+        ax.plot(df_plot_base.index, df_plot_base["Close"], label=f"実績値 ({ticker_name})", color='dodgerblue', lw=1.8, alpha=0.8)
+        ma_colors = ['darkorange', 'forestgreen', 'mediumpurple', 'sienna']
+
+        for i, window in enumerate(self.ma_windows_plot):
+            ma_col = f"MA{window}"
+            if ma_col in df_plot_base.columns:
+                ax.plot(df_plot_base.index, df_plot_base[ma_col], label=f"MA{window}", color=ma_colors[i % len(ma_colors)], lw=1.2, alpha=0.9)
+
+        # クロスシグナルのプロット
+        short_ma_col = f"MA{self.ma_windows_plot[0]}" if self.ma_windows_plot else None
+        if "golden_cross" in df_plot_base.columns and short_ma_col and short_ma_col in df_plot_base.columns:
+            gc_points = df_plot_base[df_plot_base["golden_cross"]]
+            if not gc_points.empty:
+                ax.scatter(gc_points.index, gc_points[short_ma_col], label="Golden Cross", marker='^', color='gold', s=120, edgecolor='black', zorder=10)
+        if "death_cross" in df_plot_base.columns and short_ma_col and short_ma_col in df_plot_base.columns:
+            dc_points = df_plot_base[df_plot_base["death_cross"]]
+            if not dc_points.empty:
+                ax.scatter(dc_points.index, dc_points[short_ma_col], label="Death Cross", marker='v', color='crimson', s=120, edgecolor='black', zorder=10)
+
+        ax.set_title(f"{ticker_name} 価格と移動平均線", fontsize=14)
+        ax.set_ylabel("価格", fontsize=12)
+        ax.legend(fontsize=10, loc='upper left')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        from matplotlib.dates import DateFormatter, MonthLocator
+        ax.xaxis.set_major_formatter(DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_locator(MonthLocator(interval=max(1, len(df_plot_base)//150)))
+        ax.tick_params(axis='x', rotation=30)
+
+    def _plot_correlation_heatmap(self, ax: Axes, df_plot_base: pd.DataFrame, ticker_symbol: str, ticker_name: str, corr_columns: List[str]) -> None:
+        available_cols = [col for col in corr_columns if col in df_plot_base.columns and df_plot_base[col].nunique(dropna=True) > 1]
+        if len(available_cols) < 2:
+            ax.text(0.5, 0.5, "相関分析に十分な列がありません", ha='center', va='center', fontsize=12, transform=ax.transAxes)
+            ax.set_title(f'{ticker_name} 相関ヒートマップ (データ不足)', fontsize=14)
+            ax.axis('off')
+            return
+
+        corr_matrix = df_plot_base[available_cols].corr()
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm_r', fmt=".2f", vmin=-1, vmax=1,
+                    linewidths=.5, cbar=True, ax=ax, annot_kws={"size": 9}, square=True)
+        ax.set_title(f'{ticker_name} 主要指標の相関 (過去{self.plot_days}日間)', fontsize=14)
+        
+        # 修正: tick_params から ha パラメータを削除し、別途設定
+        ax.tick_params(axis='x', rotation=45, labelsize=10)
+        ax.tick_params(axis='y', rotation=0, labelsize=10)
+        
+        # X軸ラベルの水平配置を個別に設定
+        for label in ax.get_xticklabels():
+            label.set_horizontalalignment('right')
+class AdvisorConfigLoader:
+    """投資アドバイザー用設定ファイルの読み込み・プロファイル管理クラス"""
+    DEFAULT_ADVISOR_CONFIG = {
+        "report_filename_template": "market_analysis_report_{profile}.json", # プロファイルごとにも可能
+        "profiles": {
+            "natural": {
+                "profile_description": "標準的なバランス型。基本閾値でシグナル判定。",
+                "signal_thresholds": {"buy": 2, "sell": 2}, "vix_threshold": 25,
+                "short_trend_threshold_pct": 0.5, "error_accept_threshold_pct": 8.0
+            },
+            "aggressive": {
+                "profile_description": "積極型。買い閾値低め、VIX許容高め。",
+                "signal_thresholds": {"buy": 1, "sell": 3}, "vix_threshold": 30,
+                "short_trend_threshold_pct": 0.2, "error_accept_threshold_pct": 10.0
+            },
+            "passive": {
+                "profile_description": "慎重型。買い閾値高め、VIX許容低め。",
+                "signal_thresholds": {"buy": 3, "sell": 1}, "vix_threshold": 20,
+                "short_trend_threshold_pct": 1.0, "error_accept_threshold_pct": 6.0
+            },
+        },
+        "technical_analysis_settings": { # 旧 technical_analysis
+            "buy_signal_columns": ["golden_cross", "RSI_buy_signal", "MACD_buy_signal", "BB_buy_signal"],
+            "sell_signal_columns": ["death_cross", "RSI_sell_signal", "MACD_sell_signal", "BB_sell_signal"],
+            "recent_days_for_signal_count": 5,
+            "ma_cross_signal_recency_days": 10
+        },
+    }
+
+    def __init__(self, config_path: str = "advisor_config.json", logger_manager: Optional[LoggerManager] = None):
+        self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
+        self.config_path = config_path
+        # Configクラスの _deep_update と _load_config を借用 (または共通化)
+        temp_main_config_loader = Config() # ダミーインスタンスでメソッド利用
+        self.config_data = temp_main_config_loader._load_config(config_path) # デフォルトは渡さない
+        # Advisorのデフォルトを適用
+        self.config_data = temp_main_config_loader._deep_update(self.DEFAULT_ADVISOR_CONFIG.copy(), self.config_data)
+
+        self.current_profile_name = "natural" # デフォルト
+        self.set_profile(self.current_profile_name)
+        self.logger.info(f"アドバイザー設定を '{config_path}' からロード。現在のプロファイル: {self.current_profile_name}")
+
+
+    def set_profile(self, profile_name: str) -> bool:
+        profiles = self.config_data.get("profiles", {})
+        if profile_name in profiles:
+            self.current_profile_name = profile_name
+            self.logger.info(f"投資アドバイザープロファイルを '{profile_name}' に変更しました。")
+            return True
+        else:
+            self.logger.warning(f"プロファイル '{profile_name}' は設定に存在しません。'{self.current_profile_name}' を維持します。")
+            return False
+
+    def get_profile_list(self) -> List[str]: return list(self.config_data.get("profiles", {}).keys())
+    def get_current_profile_config(self) -> Dict[str, Any]: return self.config_data.get("profiles", {}).get(self.current_profile_name, {})
+    def get_profile_description(self) -> str: return self.get_current_profile_config().get("profile_description", "説明なし")
+
+    def get_config_value(self, key_path: str, default: Optional[Any] = None) -> Any:
+        keys = key_path.split('.')
+        # 1. プロファイル固有設定
+        val = self.get_current_profile_config()
+        for key in keys:
+            if isinstance(val, dict) and key in val: val = val[key]
+            else: val = None; break # 見つからなければNoneにして共通設定へ
+        if val is not None: return val
+        # 2. 共通設定
+        val_common = self.config_data
+        for key in keys:
+            if isinstance(val_common, dict) and key in val_common: val_common = val_common[key]
+            else: return default # 共通にもなければデフォルト
+        return val_common
+
+
+class MarketDataAnalyzer:
+    """市場データ分析のためのユーティリティ関数群"""
+    
+    def __init__(self, logger_manager: Optional[LoggerManager] = None):
+        self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
+    
+    @staticmethod
+    def get_nested_value(data: dict, keys: list, default=None):
+        """ネストされた辞書から値を安全に取得"""
+        for key in keys:
+            if isinstance(data, dict) and key in data:
+                data = data[key]
+            else:
+                return default
+        return data
+    
+    def find_last_signal_date(self, df: pd.DataFrame, signal_column_name: str) -> Optional[pd.Timestamp]:
+        """指定されたシグナル列の最後の発生日を検索"""
+        if signal_column_name not in df.columns or df[signal_column_name].dtype != 'bool':
+            self.logger.debug(f"シグナル列 '{signal_column_name}' 不在または非bool型。")
+            return None
+        try:
+            true_signals = df.loc[df[signal_column_name]]  # .loc で FutureWarning 回避
+            return pd.Timestamp(true_signals.index.max()) if not true_signals.empty else None
+        except Exception as e:
+            self.logger.warning(f"'{signal_column_name}' 最終シグナル日検索エラー: {e}", exc_info=True)
+            return None
+    
+    def is_date_within_recent_days(self, latest_market_date: pd.Timestamp,
+                                   target_event_date: Optional[pd.Timestamp], recent_days_threshold: int) -> bool:
+        """指定された日付が最近の閾値日数以内かを判定"""
+        if target_event_date is None:
+            return False
+        if not (isinstance(latest_market_date, pd.Timestamp) and isinstance(target_event_date, pd.Timestamp)):
+            self.logger.warning("is_date_within_recent_days: 日付がTimestamp型ではありません。")
+            return False
+        return (latest_market_date - target_event_date).days <= recent_days_threshold
+    
+    def calculate_trend_percentage(self, prediction_array: Any, period_name: str = "期間", 
+                                  current_market_price: Optional[float] = None) -> float:
+        """
+        予測配列から現在価格を基準としたトレンド%を計算
+        
+        Args:
+            prediction_array: 予測価格の配列
+            period_name: ログ用の期間名
+            current_market_price: 現在の市場価格（基準価格）
+        
+        Returns:
+            float: トレンド% (正=上昇、負=下降)
+        """
+        try:
+            # データ型の統一
+            if isinstance(prediction_array, pd.Series):
+                values = prediction_array.dropna().values
+            elif isinstance(prediction_array, np.ndarray):
+                values = prediction_array.flatten()
+            elif isinstance(prediction_array, list):
+                values = np.array([v for v in prediction_array if v is not None and not np.isnan(v)])
+            else:
+                self.logger.warning(f"{period_name}トレンド計算: 未対応型 {type(prediction_array)}")
+                return 0.0
+            
+            if len(values) < 1:
+                self.logger.debug(f"{period_name}トレンド計算: データ点不足 ({len(values)})")
+                return 0.0
+            
+            # 基準価格の決定（現在価格 > 予測の最初の値）
+            if current_market_price is not None and current_market_price > 0:
+                base_price = current_market_price
+            else:
+                base_price = values[0]
+            
+            # 終了価格（予測の最後の値）
+            end_price = values[-1]
+            
+            # バリデーション
+            if base_price <= 0 or np.isnan(base_price) or np.isnan(end_price):
+                self.logger.debug(f"{period_name}トレンド計算: 無効な価格データ (base: {base_price}, end: {end_price})")
+                return 0.0
+            
+            # トレンド%計算（正=上昇、負=下降）
+            trend_pct = ((end_price - base_price) / base_price) * 100
+            
+            self.logger.debug(f"{period_name}トレンド計算: {base_price:.2f} → {end_price:.2f} = {trend_pct:.2f}%")
+            
+            return float(trend_pct)
+            
+        except Exception as e:
+            self.logger.warning(f"{period_name}トレンド計算エラー: {e}", exc_info=True)
+            return 0.0
+    
+    def get_sp500_dataframe(self, market_data_dict: Dict[str, Dict[str, Any]]) -> Optional[pd.DataFrame]:
+        """市場データ辞書からS&P500 DataFrameを取得"""
+        sp500_entry = market_data_dict.get("^GSPC")
+        if not sp500_entry or "df" not in sp500_entry or sp500_entry["df"].empty:
+            self.logger.error("S&P500 DataFrameが見つからないか空です。")
+            return None
+        return sp500_entry["df"]
