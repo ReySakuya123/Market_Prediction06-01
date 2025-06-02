@@ -648,23 +648,43 @@ class InvestmentAdvisor:
             return {}, {}
 
     def _generate_comprehensive_market_assessment(self, market_status: Dict, predictions: Dict, 
-                                                  model_errors: Dict, tech_signals: Dict) -> MarketAssessment:
-        """総合市場評価を生成（AI予測重視＋極端値抑制・重み調整版）"""
-        try:
-            # --- AI予測の信頼度補正（極端な値を抑制） ---
-            for period in ['nextday_price', 'short_term', 'long_term']:
-                pred_key = 'change_pct' if period == 'nextday_price' else 'trend_pct'
-                pred = predictions.get(period, {})
-                trend_pct_val = pred.get(pred_key, 0)
-                confidence = pred.get('confidence', 0.5)
+                                              model_errors: Dict, tech_signals: Dict) -> MarketAssessment:
+    """修正版: AI予測を最優先する総合評価"""
+    try:
+        # === STEP 1: AI予測の信頼性評価 ===
+        long_term_pred = predictions.get("long_term", {})
+        ai_confidence = long_term_pred.get("confidence", 0)
+        ai_trend = long_term_pred.get("trend_pct", 0)
+        
+        # === STEP 2: AI信頼度が高い場合は最優先 ===
+        if ai_confidence > 0.80:  # 高信頼度AI予測
+            self.logger.info(f"高信頼度AI予測モード: 信頼度={ai_confidence:.1%}, 予測={ai_trend:.2f}%")
+            
+            # AI予測ベースの直接判定
+            if ai_trend < -3.0:
+                trend = "bearish"
+                final_confidence = ai_confidence * 0.95  # 高信頼度を維持
+            elif ai_trend > 3.0:
+                trend = "bullish"
+                final_confidence = ai_confidence * 0.95
+            else:
+                trend = "neutral"
+                final_confidence = ai_confidence * 0.90
                 
-                # 定数を使用してマジックナンバーを排除
-                if abs(trend_pct_val) > self.EXTREME_CHANGE_THRESHOLD_HIGH:
-                    pred['confidence'] = confidence * self.CONFIDENCE_REDUCTION_HIGH
-                elif abs(trend_pct_val) > self.EXTREME_CHANGE_THRESHOLD_MID:
-                    pred['confidence'] = confidence * self.CONFIDENCE_REDUCTION_MID
-
-            # --- 総合トレンドを加重平均で算出 ---
+            # テクニカル分析は補正のみに使用
+            buy_score = tech_signals.get("total_buy_score", 0)
+            sell_score = tech_signals.get("total_sell_score", 0)
+            
+            # 極端なテクニカル逆信号の場合のみ微調整
+            if trend == "bearish" and buy_score > 8:  # 極端な買いシグナル
+                final_confidence *= 0.9  # 信頼度を僅かに下げる
+            elif trend == "bullish" and sell_score > 8:  # 極端な売りシグナル
+                final_confidence *= 0.9
+                
+        else:
+            # === STEP 3: 低信頼度の場合は従来ロジック ===
+            self.logger.info(f"低信頼度モード: 信頼度={ai_confidence:.1%}")
+            # 従来の加重平均ロジックを使用
             weights = {'nextday_price': 0.4, 'short_term': 0.4, 'long_term': 0.2}
             weighted_trend = 0
             total_weight = 0
@@ -672,78 +692,186 @@ class InvestmentAdvisor:
             for period in ['nextday_price', 'short_term', 'long_term']:
                 pred_key = 'change_pct' if period == 'nextday_price' else 'trend_pct'
                 pred = predictions.get(period, {})
-                trend = pred.get(pred_key, 0)
+                trend_val = pred.get(pred_key, 0)
                 conf = pred.get('confidence', 0)
                 weight = weights[period] * conf
-                weighted_trend += trend * weight
+                weighted_trend += trend_val * weight
                 total_weight += weight
                 
             final_trend = weighted_trend / total_weight if total_weight > 0 else 0
             final_confidence = total_weight / sum(weights.values()) if sum(weights.values()) > 0 else 0.5
-
-            # --- トレンド判定 ---
+            
+            # 従来の閾値判定
             if final_trend < -3:
                 trend = "bearish"
             elif final_trend > 3:
                 trend = "bullish"
             else:
                 trend = "neutral"
+        
+        # === 以下リスク評価は従来通り ===
+        vix_value = market_status.get("VIX", 20)
+        volatility = market_status.get("volatility_5d", 0)
+        risk_factors = 0
+        
+        if vix_value > 30: risk_factors += 3
+        elif vix_value > 25: risk_factors += 2
+        elif vix_value > 20: risk_factors += 1
+        if volatility > 25: risk_factors += 2
+        elif volatility > 15: risk_factors += 1
+        if final_confidence < 0.4: risk_factors += 1
 
-            # テクニカル分析
-            buy_score = tech_signals.get("total_buy_score", 0)
-            sell_score = tech_signals.get("total_sell_score", 0)
+        if risk_factors >= 5:
+            risk_level = "high"
+        elif risk_factors >= 2:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
 
-            # テクニカルとAI予測の統合（重み付け改善）
-            ai_weight = 0.6  # AI予測の重みを増加
-            tech_weight = 0.4  # テクニカルの重みを削減
+        # テクニカルスコア
+        buy_score = tech_signals.get("total_buy_score", 0)
+        sell_score = tech_signals.get("total_sell_score", 0)
+        total_signals = buy_score + sell_score
+        tech_score = buy_score / total_signals if total_signals > 0 else 0.5
+        tech_score = max(0.0, min(1.0, tech_score))
 
-            if trend == "bullish" and sell_score > buy_score + 2:
-                # AI予測が大幅下落の場合はより慎重に
-                if final_trend < -5:
-                    trend = "bearish"  # 強制的にbearishに変更
-                    final_confidence *= 0.6
-                else:
-                    trend = "neutral"
-                    final_confidence *= 0.8
-            elif trend == "neutral":
-                if buy_score > sell_score + 1:
-                    trend = "bullish"
-                    final_confidence += 0.1
-                elif sell_score > buy_score + 1:
-                    trend = "bearish"
-                    final_confidence += 0.1
+        result = MarketAssessment(
+            trend=trend,
+            confidence=max(0.1, min(0.9, final_confidence)),
+            risk_level=risk_level,
+            tech_score=tech_score,
+            ai_reliability=ai_confidence
+        )
+        
+        self.logger.info(f"修正版総合評価: {trend}, AI信頼度={ai_confidence:.1%}, 最終信頼度={final_confidence:.2f}")
+        return result
 
-            # リスクレベル
-            vix_value = market_status.get("VIX", 20)
-            volatility = market_status.get("volatility_5d", 0)
-            risk_factors = 0
+    except Exception as e:
+        self.logger.error(f"総合市場評価エラー: {e}", exc_info=True)
+        return MarketAssessment(
+            trend="neutral", confidence=0.5, risk_level="high",
+            tech_score=0.5, ai_reliability=0.5
+        )
+1-2. 投資アドバイス生成の致命的ロジック修正
+Python
+# 修正箇所: 行776-862 (_generate_investment_advice_from_assessment)
+def _generate_investment_advice_from_assessment(self, assessment: MarketAssessment) -> Dict[str, Any]:
+    """修正版: AI予測重視の投資アドバイス生成"""
+    try:
+        config = self._get_current_config()
+        confidence_threshold = config.get("confidence_threshold", 0.6)
+        
+        # === 重複計算を排除 ===
+        # 既にassessmentに含まれているAI情報を使用
+        ai_trend = getattr(assessment, '_ai_trend', None)
+        if ai_trend is None:
+            # フォールバック: 必要な場合のみ計算
+            predictions, _ = self._get_ai_predictions_summary()
+            ai_trend = predictions.get("long_term", {}).get("trend_pct", 0)
+        
+        ai_confidence = assessment.ai_reliability
+        
+        # === AI信頼度ベースの判定 ===
+        if ai_confidence > 0.80:
+            self.logger.info(f"高信頼度AI判定モード: AI予測={ai_trend:.2f}%, 信頼度={ai_confidence:.1%}")
             
-            if vix_value > 30: 
-                risk_factors += 3
-            elif vix_value > 25: 
-                risk_factors += 2
-            elif vix_value > 20: 
-                risk_factors += 1
-            if volatility > 25: 
-                risk_factors += 2
-            elif volatility > 15: 
-                risk_factors += 1
-            if final_confidence < 0.4: 
-                risk_factors += 1
-
-            if risk_factors >= 5:
-                risk_level = "high"
-            elif risk_factors >= 2:
-                risk_level = "medium"
+            # AI予測を最優先
+            if ai_trend < -3.0:
+                primary_action = "SELL"
+                action_strength = "強" if ai_trend < -5.0 else "中"
+                reason = f"高信頼度AI下落予測({ai_trend:.1f}%)"
+                
+            elif ai_trend > 3.0:
+                primary_action = "BUY"
+                action_strength = "強" if ai_trend > 5.0 else "中"
+                reason = f"高信頼度AI上昇予測(+{ai_trend:.1f}%)"
+                
+            else:  # -3% ≤ ai_trend ≤ 3%
+                primary_action = "HOLD"
+                action_strength = "中"
+                reason = f"AI予測が中立範囲({ai_trend:.1f}%)"
+            
+            # テクニカル分析による微調整
+            if assessment.trend != "neutral":
+                if assessment.trend == "bullish" and primary_action == "SELL":
+                    action_strength = "弱"  # 強度を下げる
+                    reason += " (テクニカル上昇で強度調整)"
+                elif assessment.trend == "bearish" and primary_action == "BUY":
+                    action_strength = "弱"
+                    reason += " (テクニカル下落で強度調整)"
+        
+        else:
+            # === 低信頼度の場合は従来ロジック ===
+            self.logger.info(f"従来判定モード: AI信頼度={ai_confidence:.1%}")
+            
+            if assessment.confidence < confidence_threshold:
+                primary_action = "HOLD"
+                action_strength = "弱"
+                reason = f"総合信頼度不足({assessment.confidence:.1%})"
+                
+            elif assessment.trend == "bullish" and assessment.risk_level != "high":
+                primary_action = "BUY"
+                action_strength = "中"
+                reason = "テクニカル上昇トレンド"
+                
+            elif assessment.trend == "bearish":
+                primary_action = "SELL"
+                action_strength = "中"
+                reason = "テクニカル下降トレンド"
+                
             else:
-                risk_level = "low"
+                primary_action = "HOLD"
+                action_strength = "中"
+                reason = "明確なトレンドなし"
 
-            # テクニカルスコア
-            tech_score = 0.5
-            total_signals = buy_score + sell_score
-            if total_signals > 0:
-                tech_score = buy_score / total_signals
-            tech_score = max(0.0, min(1.0, tech_score))
+        # === 警告生成 ===
+        warnings = []
+        if ai_confidence > 0.80:  # 高信頼度AI予測の場合
+            if ai_trend < -5:
+                warnings.append(f"🚨 高信頼度AI予測: 大幅下落警告({ai_trend:.1f}%)")
+            elif ai_trend < -2:
+                warnings.append(f"⚠️ 高信頼度AI予測: 下落リスク({ai_trend:.1f}%)")
+            elif ai_trend > 5:
+                warnings.append(f"📈 高信頼度AI予測: 大幅上昇期待(+{ai_trend:.1f}%)")
+        
+        if assessment.risk_level == "high":
+            warnings.append("⚠️ 高リスク市場環境")
+        if assessment.confidence < 0.4:
+            warnings.append("⚠️ 予測信頼度が低下")
+
+        warnings.extend([
+            "投資は元本保証がありません。余裕資金での投資を心がけてください。",
+            "このアドバイスは情報提供目的であり、投資の最終判断はご自身で行ってください。"
+        ])
+
+        return {
+            "primary_action": primary_action,
+            "action_strength": action_strength,
+            "risk_assessment": f"{assessment.risk_level}リスク",
+            "confidence_score": assessment.confidence,
+            "profile_adjusted_advice": {
+                "advice_text": f"【{self.current_profile.upper()}】{primary_action}推奨（{action_strength}）- {reason}",
+                "position_sizing": self._get_position_sizing_advice(primary_action, assessment.risk_level)
+            },
+            "key_factors": [
+                f"AI予測: {ai_trend:+.1f}% (信頼度: {ai_confidence:.1%})",
+                f"市場トレンド: {assessment.trend}",
+                f"総合信頼度: {assessment.confidence:.1%}",
+                f"リスクレベル: {assessment.risk_level}",
+                f"判定モード: {'AI優先' if ai_confidence > 0.80 else '従来ロジック'}"
+            ],
+            "recommendations": self._get_basic_recommendations(primary_action),
+            "warnings": warnings[:5]
+        }
+
+    except Exception as e:
+        self.logger.error(f"投資アドバイス生成エラー: {e}")
+        return {
+            "error": str(e),
+            "primary_action": "HOLD",
+            "action_strength": "弱",
+            "risk_assessment": "エラーにより高リスク"
+        }
 
             # AI信頼度
             ai_reliability = final_confidence
@@ -897,45 +1025,52 @@ class InvestmentAdvisor:
         return recommendations.get(action, recommendations["HOLD"])
 
     def generate_investment_advice(self) -> Dict[str, Any]:
-        """投資アドバイス生成（変数名修正版）"""
-        try:
-            self.logger.info(f"投資アドバイスレポート生成開始 (プロファイル: {self.current_profile})")
-            
-            market_status = self._get_current_market_status()
-            predictions, model_errors = self._get_ai_predictions_summary()  # 変数名修正
-            tech_signals = self._get_technical_signals_summary()
-            
-            assessment = self._generate_comprehensive_market_assessment(
-                market_status, predictions, model_errors, tech_signals
-            )
-            
-            advice = self._generate_investment_advice_from_assessment(assessment)
-            
-            return {
-                "metadata": {
-                    "generated_at": datetime.now().isoformat(),
-                    "profile": self.current_profile,
-                    "calculation_errors": self.calculation_errors
-                },
-                "market_analysis": {
-                    "current_status": market_status,
-                    "ai_predictions": predictions,
-                    "model_reliability": model_errors,  # 変数名を明確化
-                    "technical_signals": tech_signals
-                },
-                "assessment": {
-                    "overall_trend": assessment.trend,
-                    "confidence_score": assessment.confidence,
-                    "risk_level": assessment.risk_level,
-                    "technical_score": assessment.tech_score,
-                    "ai_reliability": assessment.ai_reliability
-                },
-                "investment_advice": advice
-            }
-            
-        except Exception as e:
-            self.logger.error(f"投資アドバイス生成エラー: {e}")
-            return {"error": str(e)}
+    """修正版: 重複計算を排除した投資アドバイス生成"""
+    try:
+        self.logger.info(f"投資アドバイスレポート生成開始 (プロファイル: {self.current_profile})")
+        
+        # === 一度だけデータを取得 ===
+        market_status = self._get_current_market_status()
+        predictions, model_errors = self._get_ai_predictions_summary()  # 一度だけ実行
+        tech_signals = self._get_technical_signals_summary()
+        
+        # === AI予測情報をassessmentに渡すため一時保存 ===
+        ai_trend = predictions.get("long_term", {}).get("trend_pct", 0)
+        
+        assessment = self._generate_comprehensive_market_assessment(
+            market_status, predictions, model_errors, tech_signals
+        )
+        
+        # AI予測情報をassessmentに追加（重複計算回避）
+        assessment._ai_trend = ai_trend  # 一時的な属性追加
+        
+        advice = self._generate_investment_advice_from_assessment(assessment)
+        
+        return {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "profile": self.current_profile,
+                "calculation_errors": self.calculation_errors
+            },
+            "market_analysis": {
+                "current_status": market_status,
+                "ai_predictions": predictions,
+                "model_reliability": model_errors,
+                "technical_signals": tech_signals
+            },
+            "assessment": {
+                "overall_trend": assessment.trend,
+                "confidence_score": assessment.confidence,
+                "risk_level": assessment.risk_level,
+                "technical_score": assessment.tech_score,
+                "ai_reliability": assessment.ai_reliability
+            },
+            "investment_advice": advice
+        }
+        
+    except Exception as e:
+        self.logger.error(f"投資アドバイス生成エラー: {e}")
+        return {"error": str(e)}
 
     def generate_investment_report(self, save_to_json: bool = False, print_to_console: bool = True) -> bool:
         """投資レポート生成"""
