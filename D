@@ -1,0 +1,651 @@
+def _generate_investment_advice_from_assessment(self, assessment: 'MarketAssessment') -> Dict[str, Any]:
+        """修正版: AI予測重視の投資アドバイス生成"""
+        try:
+            config = self._get_current_config()
+            confidence_threshold = config.get("confidence_threshold", 0.6)
+            
+            # === 重複計算を排除 ===
+            # 既にassessmentに含まれているAI情報を使用
+            ai_trend = getattr(assessment, '_ai_trend', None)
+            if ai_trend is None:
+                # フォールバック: 必要な場合のみ計算
+                predictions, _ = self._get_ai_predictions_summary()
+                ai_trend = predictions.get("long_term", {}).get("trend_pct", 0)
+            
+            ai_confidence = assessment.ai_reliability
+            
+            primary_action = "HOLD" # デフォルト値
+            action_strength = "中" # デフォルト値
+            reason = "初期状態" # デフォルト値
+
+            # === AI信頼度ベースの判定 ===
+            if ai_confidence > 0.80:
+                self.logger.info(f"高信頼度AI判定モード: AI予測={ai_trend:.2f}%, 信頼度={ai_confidence:.1%}")
+                
+                if ai_trend < -3.0:
+                    primary_action = "SELL"
+                    action_strength = "強" if ai_trend < -5.0 else "中"
+                    reason = f"高信頼度AI下落予測({ai_trend:.1f}%)"
+                elif ai_trend > 3.0:
+                    primary_action = "BUY"
+                    action_strength = "強" if ai_trend > 5.0 else "中"
+                    reason = f"高信頼度AI上昇予測(+{ai_trend:.1f}%)"
+                else:  # -3% ≤ ai_trend ≤ 3%
+                    primary_action = "HOLD"
+                    action_strength = "中"
+                    reason = f"AI予測が中立範囲({ai_trend:.1f}%)"
+                
+                # テクニカル分析による微調整
+                if assessment.trend != "neutral":
+                    if assessment.trend == "bullish" and primary_action == "SELL":
+                        action_strength = "弱"  # 強度を下げる
+                        reason += " (テクニカル上昇で強度調整)"
+                    elif assessment.trend == "bearish" and primary_action == "BUY":
+                        action_strength = "弱"
+                        reason += " (テクニカル下落で強度調整)"
+            
+            else:
+                # === 低信頼度の場合は従来ロジック ===
+                self.logger.info(f"従来判定モード: AI信頼度={ai_confidence:.1%}")
+                
+                if assessment.confidence < confidence_threshold:
+                    primary_action = "HOLD"
+                    action_strength = "弱"
+                    reason = f"総合信頼度不足({assessment.confidence:.1%})"
+                elif assessment.trend == "bullish" and assessment.risk_level != "high":
+                    primary_action = "BUY"
+                    action_strength = "中"
+                    reason = "テクニカル上昇トレンド"
+                elif assessment.trend == "bearish":
+                    primary_action = "SELL"
+                    action_strength = "中"
+                    reason = "テクニカル下降トレンド"
+                else:
+                    primary_action = "HOLD"
+                    action_strength = "中"
+                    reason = "明確なトレンドなし"
+
+            # === 警告生成 ===
+            warnings: List[str] = []
+            if ai_confidence > 0.80:  # 高信頼度AI予測の場合
+                if ai_trend < -5:
+                    warnings.append(f"🚨 高信頼度AI予測: 大幅下落警告({ai_trend:.1f}%)")
+                elif ai_trend < -2:
+                    warnings.append(f"⚠️ 高信頼度AI予測: 下落リスク({ai_trend:.1f}%)")
+                elif ai_trend > 5:
+                    warnings.append(f"📈 高信頼度AI予測: 大幅上昇期待(+{ai_trend:.1f}%)")
+            
+            if assessment.risk_level == "high":
+                warnings.append("⚠️ 高リスク市場環境")
+            if assessment.confidence < 0.4:
+                warnings.append("⚠️ 予測信頼度が低下")
+
+            warnings.extend([
+                "投資は元本保証がありません。余裕資金での投資を心がけてください。",
+                "このアドバイスは情報提供目的であり、投資の最終判断はご自身で行ってください。"
+            ])
+
+            return {
+                "primary_action": primary_action,
+                "action_strength": action_strength,
+                "risk_assessment": f"{assessment.risk_level}リスク",
+                "confidence_score": assessment.confidence,
+                "profile_adjusted_advice": {
+                    "advice_text": f"【{self.current_profile.upper()}】{primary_action}推奨（{action_strength}）- {reason}",
+                    "position_sizing": self._get_position_sizing_advice(primary_action, assessment.risk_level)
+                },
+                "key_factors": [
+                    f"AI予測: {ai_trend:+.1f}% (信頼度: {ai_confidence:.1%})",
+                    f"市場トレンド: {assessment.trend}",
+                    f"総合信頼度: {assessment.confidence:.1%}",
+                    f"リスクレベル: {assessment.risk_level}",
+                    f"判定モード: {'AI優先' if ai_confidence > 0.80 else '従来ロジック'}"
+                ],
+                "recommendations": self._get_basic_recommendations(primary_action),
+                "warnings": warnings[:5] # 警告は最大5件
+            }
+
+        except Exception as e:
+            self.logger.error(f"投資アドバイス生成エラー: {e}", exc_info=True)
+            return {
+                "error": str(e),
+                "primary_action": "HOLD",
+                "action_strength": "弱",
+                "risk_assessment": "エラーにより高リスク"
+            }
+
+from dataclasses import dataclass # MarketAssessment の仮定義用
+import logging # ロガー用
+
+# MarketAssessment クラスの仮定義（実際のプロジェクトの定義に置き換えてください）
+@dataclass
+class MarketAssessment:
+    trend: str
+    confidence: float
+    risk_level: str
+    tech_score: float
+    ai_reliability: float
+
+class InvestmentStrategy: # このメソッドが属する可能性のあるクラスの仮名
+    def __init__(self):
+        # self.logger の初期化の例 (実際のロガーを使用してください)
+        self.logger = logging.getLogger(__name__)
+        # 簡単なテストのために標準出力にログを出す設定
+        if not self.logger.hasHandlers(): # 重複してハンドラが追加されるのを防ぐ
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
+
+    # --- 修正されたメソッド ---
+    def _create_market_assessment_internal(self, trend: str, final_confidence: float, risk_level: str, tech_score: float, ai_reliability_param: float) -> 'MarketAssessment':
+        """
+        総合市場評価を生成する内部関数。
+        元のコードの `ai_reliability = final_confidence` という行と、
+        MarketAssessmentの引数から、final_confidence が総合的な信頼度で、
+        ai_reliability_param がAI固有の信頼度と解釈。
+        """
+        try:
+            # confidenceは0.1から0.9の範囲に収める
+            clipped_confidence = max(0.1, min(0.9, final_confidence))
+
+            # MarketAssessmentクラスの実際のフィールド名に合わせてください
+            # MarketAssessmentの型定義があれば、以下の # type: ignore コメントは不要です
+            result = MarketAssessment(
+                trend=trend,
+                confidence=clipped_confidence,
+                risk_level=risk_level,
+                tech_score=tech_score,
+                ai_reliability=ai_reliability_param
+            )
+            self.logger.info(f"総合評価: {trend}, 信頼度={result.confidence:.2f}, リスク={risk_level}, AI信頼度={result.ai_reliability:.2f}")
+            return result
+
+        except Exception as e:
+            self.logger.error(f"総合市場評価の生成中にエラーが発生しました: {e}", exc_info=True)
+            # デフォルト値を返す
+            # MarketAssessmentの型定義があれば、以下の # type: ignore コメントは不要です
+            return MarketAssessment(
+                trend="neutral",
+                confidence=0.5,
+                risk_level="medium",
+                tech_score=0.5,
+                ai_reliability=0.5
+            )
+
+
+    def generate_investment_advice(self) -> Dict[str, Any]:
+        """修正版: 重複計算を排除した投資アドバイス生成"""
+        try:
+            self.logger.info(f"投資アドバイスレポート生成開始 (プロファイル: {self.current_profile})")
+
+            # === 一度だけデータを取得 ===
+            market_status = self._get_current_market_status()
+            predictions, model_errors = self._get_ai_predictions_summary()  # 一度だけ実行
+            tech_signals = self._get_technical_signals_summary()
+
+            # === AI予測情報をassessmentに渡すため一時保存 ===
+            ai_trend = predictions.get("long_term", {}).get("trend_pct", 0.0) # デフォルト値をfloatに
+
+            assessment = self._generate_comprehensive_market_assessment(
+                market_status, predictions, model_errors, tech_signals
+            )
+
+            # AI予測情報をassessmentに追加（重複計算回避）
+            # MarketAssessmentクラスがこの属性を許容するように注意
+            assessment._ai_trend = ai_trend
+
+            advice = self._generate_investment_advice_from_assessment(assessment)
+
+            return {
+                "metadata": {
+                    "generated_at": datetime.now().isoformat(),
+                    "profile": self.current_profile,
+                    "calculation_errors": self.calculation_errors # self.calculation_errorsが定義されている前提
+                },
+                "market_analysis": {
+                    "current_status": market_status,
+                    "ai_predictions": predictions,
+                    "model_reliability": model_errors,
+                    "technical_signals": tech_signals
+                },
+                "assessment": {
+                    "overall_trend": assessment.trend,
+                    "confidence_score": assessment.confidence,
+                    "risk_level": assessment.risk_level,
+                    "technical_score": assessment.tech_score,
+                    "ai_reliability": assessment.ai_reliability
+                },
+                "investment_advice": advice
+            }
+
+        except Exception as e:
+            self.logger.error(f"投資アドバイス生成エラー: {e}", exc_info=True) # exc_info=True を追加
+            return {"error": str(e)}
+
+
+    def generate_investment_report(self, save_to_json: bool = False, print_to_console: bool = True) -> bool:
+        """投資レポート生成"""
+        try:
+            self.logger.info("投資レポート生成を開始します")
+            report_data = self.generate_investment_advice()
+            
+            if "error" in report_data:
+                self.logger.error(f"レポート生成エラー: {report_data['error']}")
+                return False
+            
+            # 予測価格のログ出力を追加
+            self._log_prediction_summary()
+            
+            # レポート表示
+            if print_to_console:
+                self._display_enhanced_report(report_data)
+            
+            # JSON保存
+            if save_to_json:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"investment_report_{timestamp}.json"
+                
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        json.dump(report_data, f, ensure_ascii=False, indent=2, default=str)
+                    self.logger.info(f"投資レポートを {filename} に保存しました")
+                except Exception as e:
+                    self.logger.error(f"JSON保存エラー: {e}")
+            
+            self.logger.info("投資レポート生成完了")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"投資レポート生成エラー: {e}")
+            return False
+
+    def _display_enhanced_report(self, report_data: Dict[str, Any]):
+        """強化されたレポート表示"""
+        prediction_prices = self._extract_prediction_prices()
+        
+        print("\n" + "="*60)
+        print("        🎯 AI投資分析レポート（強化版） 🎯")
+        print("="*60)
+        print(f"📅 生成日時: {report_data.get('metadata', {}).get('generated_at', 'N/A')}")
+        print(f"👤 投資プロファイル: {self.current_profile.upper()}")
+        
+        # AI予測価格セクションを追加
+        print("\n🔮 【AI予測価格】")
+        if 'nextday' in prediction_prices:
+            print(f"翌日予測: ${prediction_prices['nextday']['price']:,.2f}")
+        if 'short' in prediction_prices:
+            print(f"短期予測（20日後）: ${prediction_prices['short']['price']:,.2f}")
+        if 'long' in prediction_prices:
+            print(f"長期予測（30日後）: ${prediction_prices['long']['price']:,.2f}")
+        
+        # 既存のセクション
+        assessment = report_data.get("assessment", {})
+        advice = report_data.get("investment_advice", {})
+        market = report_data.get("market_analysis", {}).get("current_status", {})
+        ai_predictions = report_data.get("market_analysis", {}).get("ai_predictions", {})
+        
+        long_term = ai_predictions.get("long_term", {})
+        ai_trend = long_term.get("trend_pct", 0)
+        ai_confidence = long_term.get("confidence", 0)
+        
+        print(f"\n🤖 【AI予測分析】")
+        print(f"長期トレンド予測: {ai_trend:+.2f}%")
+        print(f"AI信頼度: {ai_confidence:.1%}")
+        
+        print(f"\n📊 【総合評価】")
+        print(f"トレンド: {assessment.get('overall_trend', 'N/A').upper()}")
+        print(f"信頼度: {assessment.get('confidence_score', 0):.1%}")
+        print(f"リスク: {assessment.get('risk_level', 'N/A').upper()}")
+        print(f"テクニカルスコア: {assessment.get('technical_score', 0):.2f}")
+        print(f"AI信頼度: {assessment.get('ai_reliability', 0):.1%}")
+        
+        print(f"\n💡 【推奨アクション】")
+        print(f"アクション: {advice.get('primary_action', 'N/A')}")
+        print(f"強度: {advice.get('action_strength', 'N/A')}")
+        
+        profile_advice = advice.get("profile_adjusted_advice", {})
+        if profile_advice:
+            print(f"アドバイス: {profile_advice.get('advice_text', 'N/A')}")
+            print(f"推奨ポジションサイズ: {profile_advice.get('position_sizing', 'N/A')}")
+        
+        key_factors = advice.get("key_factors", [])
+        if key_factors:
+            print(f"\n🔍 【主要判断要因】")
+            for factor in key_factors:
+                print(f"• {factor}")
+        
+        warnings = advice.get("warnings", [])
+        if warnings:
+            print(f"\n⚠️ 【警告・注意事項】")
+            for i, warning in enumerate(warnings[:3], 1):
+                print(f"{i}. {warning}")
+        
+        if market and "error" not in market:
+            print(f"\n📈 【市場状況】")
+            print(f"S&P500価格: ${market.get('current_price', 0):.2f}")
+            print(f"日次変動: {market.get('daily_change', 0):+.2f}%")
+            print(f"VIX指数: {market.get('VIX', 0):.1f} ({market.get('vix_level', 'N/A')})")
+            print(f"5日ボラティリティ: {market.get('volatility_5d', 0):.1f}%")
+        
+        print("="*60)
+
+    def _debug_ai_predictions_detailed(self):
+        """AI予測データの詳細デバッグ（本番環境対応版）"""
+        self.logger.debug("=== AI予測データ詳細分析 ===")
+        for model_key, model_result in self.trained_models_results.items():
+            self.logger.debug(f"\n--- {model_key}モデル詳細 ---")
+            if isinstance(model_result, dict):
+                for key, value in model_result.items():
+                    try:
+                        if isinstance(value, list):
+                            if len(value) > 0:
+                                self.logger.debug(f"  {key}: List[{len(value)}] - 最後の3つ: {value[-3:]}")
+                            else:
+                                self.logger.debug(f"  {key}: 空のリスト")
+                        elif isinstance(value, (int, float)):
+                            self.logger.debug(f"  {key}: {value}")
+                        else:
+                            self.logger.debug(f"  {key}: {type(value)}")
+                    except Exception as e:
+                        self.logger.debug(f"  {key}: デバッグ表示エラー - {e}")
+                
+                # 特に重要なデータの詳細チェック
+                try:
+                    if 'y_pred_original_test' in model_result and 'y_test_original_test' in model_result:
+                        pred = model_result['y_pred_original_test']
+                        actual = model_result['y_test_original_test']
+                        if isinstance(pred, list) and isinstance(actual, list):
+                            self.logger.debug(f"  予測データ長: {len(pred)}, 実際データ長: {len(actual)}")
+                            if len(pred) > 0 and len(actual) > 0:
+                                self.logger.debug(f"  最後の予測値: {pred[-1]}, 最後の実際値: {actual[-1]}")
+                    
+                    if 'latest_prediction_original' in model_result:
+                        latest = model_result['latest_prediction_original']
+                        self.logger.debug(f"  最新予測値: {latest}")
+                except Exception as e:
+                    self.logger.debug(f"  重要データチェックエラー: {e}")
+
+
+
+    
+    def _save_report_to_json(self, report_data: Dict[str, Any]) -> bool:
+        try:
+            filename = f"investment_report_{self.current_profile}_{datetime.now():%Y%m%d_%H%M%S}.json"
+            return bool(self._save_analysis_report(report_data, filename))
+        except Exception as e:
+            self.logger.error(f"JSON保存エラー: {e}")
+            return False
+
+    def _save_analysis_report(self, report_data: Dict[str, Any], filename: str) -> Optional[str]:
+        def clean_data(obj):
+            if isinstance(obj, dict):
+                return {k: clean_data(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_data(v) for v in obj]
+            elif pd.isna(obj): # np.isnan は数値のみ, pd.isna はより広範
+                return None # JSONではNaNは非標準なのでNoneに
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, pd.Timestamp):
+                return obj.isoformat()
+            return obj
+        
+        try:
+            cleaned_report_data = clean_data(report_data) # クリーンアップ処理
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(cleaned_report_data, f, ensure_ascii=False, indent=2, default=str)
+            self.logger.info(f"レポート保存: {filename}")
+            return filename
+        except Exception as e:
+            self.logger.error(f"保存エラー: {e}")
+            return None
+
+    def validate_system(self) -> Dict[str, Any]:
+        validation = {
+            "market_data_loaded": self.sp500_df is not None and not self.sp500_df.empty,
+            "ai_models_loaded": len(self.trained_models_results) > 0,
+            "profile_valid": self.current_profile in self.PROFILES,
+            "config_accessible": self._get_current_config() is not None,
+            "ai_predictions_working": False  # これをチェック
+        }
+        
+        # AI予測の動作確認
+        try:
+            predictions, _ = self._get_ai_predictions_summary()
+            long_term_trend = predictions.get("long_term", {}).get("trend_pct", 0)
+            validation["ai_predictions_working"] = abs(long_term_trend) > 0.001 # ゼロでないことを確認
+        except Exception: # 詳細なエラーハンドリングは省略
+            pass
+        
+        validation["overall_valid"] = all(validation.values())
+        return validation
+
+
+class MarketPredictionSystem:
+    """金融市場予測システムのメインクラス"""
+
+    def __init__(
+        self, config_file: str = "config.json", advisor_config_file: str = "advisor_config.json",
+        logger_manager: LoggerManager = APP_LOGGER_MANAGER, # 外部からLoggerManagerを注入可能に
+        reuse_hyperparams_on_init: bool = False,
+        data_source_type: str = "api" # "api" or "csv"
+    ):
+        self.logger_manager = logger_manager
+        self.logger = self.logger_manager.get_logger(self.__class__.__name__)
+        self.logger.info(f"システム初期化開始。メイン設定: {config_file}, アドバイザー設定: {advisor_config_file}, データソース: {data_source_type}")
+
+        self.config = Config(config_file, logger_manager=self.logger_manager)
+
+        # HTTPセッション (DataFetcher API用)
+        self.http_session: Optional[Any] = None # CurlSessionのインスタンス
+        if CurlSession: # グローバルCurlSessionが定義されていれば
+            try:
+                if CurlSession.__module__.startswith("curl_cffi"):
+                    self.http_session = CurlSession(impersonate="chrome110")
+                    self.logger.info("HTTPセッションに curl_cffi.requests.Session を使用します。")
+                else:
+                    self.http_session = CurlSession()
+                    self.logger.info("HTTPセッションに requests.Session を使用します。")
+            except Exception as e:
+                self.logger.warning(f"グローバルCurlSessionからのHTTPセッション初期化に失敗: {e}")
+        else:
+            self.logger.warning("CurlSessionエイリアスが未定義。APIベースのDataFetcherはHTTPセッションなしで動作します。")
+
+        # データフェッチャーの選択
+        self.data_source_type = data_source_type.lower()
+        if self.data_source_type == "csv":
+            self.data_fetcher: Union[CSVDataFetcher, DataFetcher] = CSVDataFetcher(self.config, self.logger_manager)
+            self.logger.info("CSVDataFetcher を使用します。")
+        elif self.data_source_type == "api":
+            self.data_fetcher = DataFetcher(self.config, self.logger_manager, session=self.http_session)
+            self.logger.info("DataFetcher (APIベース) を使用します。")
+        else:
+            self.logger.error(f"無効なデータソースタイプ: {data_source_type}。'api' または 'csv' を指定してください。APIをデフォルトとします。")
+            self.data_fetcher = DataFetcher(self.config, self.logger_manager, session=self.http_session) # フォールバック
+
+        self.feature_engineering = FeatureEngineering(self.config, self.logger_manager)
+        self.lstm_model = LSTMModel(self.config, self.logger_manager)
+        self.visualizer = MarketVisualizer(self.config, self.logger_manager)
+        self.advisor_config_file = advisor_config_file # InvestmentAdvisor初期化時に渡す
+
+        if reuse_hyperparams_on_init:
+            self.lstm_model.load_best_params()
+
+        self.market_data_store: Dict[str, Any] = {}
+        self.trained_models_store: Dict[str, Any] = {}
+
+
+    def run(
+        self, force_hyperparam_optimization: bool = False,
+        optimization_n_trials: Optional[int] = None,
+        generate_report_profile: str = "natural"
+    ) -> bool:
+        self.logger.info(f"システム実行開始。最適化強制:{force_hyperparam_optimization}, Optuna試行:{optimization_n_trials or 'デフォルト'}, レポートプロファイル:{generate_report_profile}")
+        run_start_time = datetime.now()
+        overall_success = False
+        try:
+            # 1. データ取得
+            self.logger.info("--- データ取得フェーズ開始 ---")
+            self.market_data_store = self.data_fetcher.fetch_all_indexes()
+            if not self.market_data_store or "^GSPC" not in self.market_data_store or self.market_data_store["^GSPC"]["df"].empty:
+                self.logger.critical("主要市場データ(S&P500)取得失敗。システム続行不可。")
+                return False
+            self.logger.info("データ取得フェーズ完了。")
+
+            # 2. 特徴量エンジニアリング
+            self.logger.info("--- 特徴量エンジニアリングフェーズ開始 ---")
+            self.market_data_store = self.feature_engineering.add_technical_indicators(self.market_data_store)
+            self.logger.info("特徴量エンジニアリングフェーズ完了。")
+
+            # 3. ハイパーパラメータ最適化 (S&P500対象)
+            if force_hyperparam_optimization or (not self.lstm_model.best_params and self.lstm_model.load_best_params() is False) : # ロード試行してダメなら
+                self.logger.info("--- LSTMハイパーパラメータ最適化フェーズ開始 (S&P500) ---")
+                if "^GSPC" in self.market_data_store and not self.market_data_store["^GSPC"]["df"].empty:
+                    self.lstm_model.optimize_hyperparameters(self.market_data_store, target_ticker="^GSPC", n_trials=optimization_n_trials)
+                else: self.logger.warning("S&P500データ不十分で最適化スキップ。")
+                self.logger.info("ハイパーパラメータ最適化フェーズ完了。")
+            else: self.logger.info("既存ハイパーパラメータ使用または最適化要求なし。")
+
+            # 4. LSTMモデル学習 (S&P500対象)
+            self.logger.info("--- LSTMモデル学習フェーズ開始 (S&P500) ---")
+            if "^GSPC" in self.market_data_store and not self.market_data_store["^GSPC"]["df"].empty:
+                if not self.lstm_model.best_params: self.lstm_model.load_best_params() # 再度ロード試行
+                self.trained_models_store = self.lstm_model.train_models_for_sp500(self.market_data_store)
+            else: self.logger.error("S&P500データ不十分でLSTM学習スキップ。")
+            self.logger.info("LSTMモデル学習フェーズ完了。")
+
+            # 5. 可視化 (S&P500対象)
+            self.logger.info("--- 可視化フェーズ開始 (S&P500) ---")
+            if "^GSPC" in self.market_data_store and self.trained_models_store:
+                graph_path = self.visualizer.plot_predictions_for_sp500(self.market_data_store, self.trained_models_store)
+                if graph_path: self.logger.info(f"分析グラフを {graph_path} に保存。")
+                else: self.logger.warning("グラフ生成/保存失敗。")
+            else: self.logger.warning("S&P500データまたは学習済モデルなし。可視化スキップ。")
+            self.logger.info("可視化フェーズ完了。")
+
+            # 6. 投資アドバイス生成 (S&P500対象)
+            self.logger.info("--- 投資アドバイス生成フェーズ開始 (S&P500) ---")
+            if "^GSPC" in self.market_data_store and self.trained_models_store:
+                advisor = InvestmentAdvisor(
+                    self.market_data_store, self.trained_models_store, self.logger_manager,
+                    self.advisor_config_file, generate_report_profile
+                )
+                if not advisor.generate_investment_advice():
+                    self.logger.warning("投資アドバイスレポート生成失敗。")
+            else: self.logger.warning("S&P500データまたは学習済モデルなし。投資アドバイス生成スキップ。")
+            self.logger.info("投資アドバイス生成フェーズ完了。")
+            overall_success = True
+
+        except KeyboardInterrupt:
+            self.logger.warning("ユーザーにより処理が中断されました。")
+        except Exception as e:
+            self.logger.critical(f"システム実行中に致命的エラー: {e}", exc_info=True)
+        finally:
+            self.logger_manager.save_performance_log() # パフォーマンスログ保存
+            duration_sec = (datetime.now() - run_start_time).total_seconds()
+            self.logger.info(f"市場予測システム全処理終了。所要時間: {duration_sec:.2f}秒。成功: {overall_success}")
+        return overall_success
+
+
+# --- Jupyter Notebook / スクリプト実行のためのメイン処理部分 ---
+if __name__ == "__main__":
+    # グローバルなLoggerManagerインスタンスを使用
+    main_logger = APP_LOGGER_MANAGER.get_logger("MainExecution")
+    main_logger.info("アプリケーション実行開始。")
+
+    # --- 設定ファイルパス (必要に応じて変更) ---
+    main_config_path = "config.json"
+    advisor_config_path = "advisor_config.json"
+    # config.jsonのサンプル (上記デフォルト設定を参考に作成してください)
+    # advisor_config.jsonのサンプル (上記デフォルト設定を参考に作成してください)
+
+    # Jupyter Notebook環境かどうかでUIを分岐
+    is_jupyter = False
+    try:
+        # Jupyter環境でのみ成功するインポート
+        from IPython import get_ipython
+        if get_ipython() is not None and 'IPKernelApp' in get_ipython().config:
+            is_jupyter = True
+            import ipywidgets as widgets
+            from IPython.display import display, clear_output
+            main_logger.info("Jupyter Notebook環境を検出。ipywidgets UIを使用します。")
+    except ImportError:
+        main_logger.info("Jupyter Notebook環境ではないか、ipywidgetsがありません。CUIモードで実行します。")
+
+
+    if is_jupyter:
+        # --- Jupyter UI ---
+        data_source_selector_ui = widgets.ToggleButtons(
+            options=[('API (yfinance)', 'api'), ('ローカルCSV', 'csv')], description='データソース:', value='api',
+            style={'button_width': 'auto'}, tooltips=['yfinance経由で最新データを取得', '事前に用意したCSVファイルを使用']
+        )
+        hyperparam_mode_selector_ui = widgets.ToggleButtons(
+            options=[('新規最適化', 'optimize'), ('保存パラメータ流用', 'reuse')], description='ハイパーパラメータ:', value='reuse',
+            style={'button_width': 'auto'}
+        )
+        optuna_trials_input_ui = widgets.IntText(
+            value=APP_LOGGER_MANAGER.get_logger("UI_Config").info("Optuna試行回数のデフォルト値はConfigから取得を推奨") or 5, # configから取得したい
+            description='Optuna試行回数:', disabled=(hyperparam_mode_selector_ui.value == 'reuse')
+        )
+        def handle_hyperparam_mode_change(change): optuna_trials_input_ui.disabled = (change.new == 'reuse')
+        hyperparam_mode_selector_ui.observe(handle_hyperparam_mode_change, names='value')
+
+        # アドバイザープロファイルはAdvisorConfigLoaderから動的に取得したい
+        # ここでは仮のリストを使用。システム実行時にAdvisorConfigLoaderが初期化されるので、その時点で取得するのが理想
+        temp_advisor_loader = AdvisorConfigLoader(advisor_config_path, APP_LOGGER_MANAGER)
+        profile_options_ui = [(p.capitalize(), p) for p in temp_advisor_loader.get_profile_list()]
+        if not profile_options_ui: profile_options_ui = [('Natural', 'natural')] # フォールバック
+
+        advisor_profile_selector_ui = widgets.Dropdown(
+            options=profile_options_ui, value=profile_options_ui[0][1] if profile_options_ui else 'natural',
+            description='投資判断プロファイル:', style={'description_width': 'initial'}
+        )
+        run_button_ui = widgets.Button(description='市場予測システム実行', button_style='success', icon='cogs')
+        output_area_ui = widgets.Output()
+
+        display(data_source_selector_ui, hyperparam_mode_selector_ui, optuna_trials_input_ui, advisor_profile_selector_ui, run_button_ui, output_area_ui)
+
+        def on_run_button_clicked_ui(b):
+            with output_area_ui:
+                clear_output(wait=True)
+                main_logger.info("--- UIからシステム実行開始 ---")
+                data_src = data_source_selector_ui.value
+                force_opt = (hyperparam_mode_selector_ui.value == 'optimize')
+                opt_trials = optuna_trials_input_ui.value if force_opt else None
+                report_prof = advisor_profile_selector_ui.value
+
+                system = MarketPredictionSystem(
+                    main_config_path, advisor_config_path, APP_LOGGER_MANAGER,
+                    reuse_hyperparams_on_init=(not force_opt), data_source_type=data_src
+                )
+                success = system.run(force_opt, opt_trials, report_prof)
+                print(f"\n🎉 システム実行 {'正常完了' if success else 'でエラー発生'} 🎉" if success else "\n💥 システム実行中にエラーが発生しました 💥")
+        run_button_ui.on_click(on_run_button_clicked_ui)
+
+    else:
+        # --- CUIフォールバック ---
+        print("="*30 + "\n金融市場予測システム (CUIモード)\n" + "="*30)
+        ds_input = input("データソースを選択 [api, csv] (デフォルト: api): ").strip().lower() or "api"
+        mode_input = input("ハイパーパラメータモードを選択 [optimize, reuse] (デフォルト: reuse): ").strip().lower() or "reuse"
+        force_opt_cui = (mode_input == "optimize")
+        opt_trials_cui_val = None
+        if force_opt_cui:
+            try: opt_trials_cui_val = int(input("Optuna試行回数を入力 (デフォルト: 5): ").strip() or "5")
+            except ValueError: opt_trials_cui_val = 5
+
+        # アドバイザープロファイル (CUI)
+        temp_advisor_loader_cui = AdvisorConfigLoader(advisor_config_path, APP_LOGGER_MANAGER)
+        profiles_cui = temp_advisor_loader_cui.get_profile_list()
+        profile_prompt = f"投資判断プロファイルを選択 [{', '.join(profiles_cui)}] (デフォルト: {profiles_cui[0] if profiles_cui else 'natural'}): "
+        profile_input_cui = input(profile_prompt).strip().lower() or (profiles_cui[0] if profiles_cui else 'natural')
+        if profile_input_cui not in profiles_cui and profiles_cui : profile_input_cui = profiles_cui[0] # 不正入力時は先頭
+
+        system_cui = MarketPredictionSystem(
+            main_config_path, advisor_config_path, APP_LOGGER_MANAGER,
+            reuse_hyperparams_on_init=(not force_opt_cui), data_source_type=ds_input
+        )
+        system_cui.run(force_opt_cui, opt_trials_cui_val, profile_input_cui)
+
+    main_logger.info("アプリケーション実行終了。")
