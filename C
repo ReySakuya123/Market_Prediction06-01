@@ -1,0 +1,818 @@
+class ReportGenerator:
+    """レポートの生成（JSON保存、コンソール出力）"""
+    def __init__(self, logger_manager: Optional[LoggerManager] = None):
+        self.logger = (logger_manager or APP_LOGGER_MANAGER).get_logger(self.__class__.__name__)
+
+    def save_report_to_json(self, report_data: Dict[str, Any], filename: str):
+        self.logger.info(f"分析レポートを '{filename}' に保存試行...")
+        try:
+            save_dir = os.path.dirname(filename)
+            if save_dir and not os.path.exists(save_dir): os.makedirs(save_dir)
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(report_data, f, indent=2, ensure_ascii=False, default=str) # default=strでdatetime等に対応
+            self.logger.info(f"分析レポートを '{filename}' に保存しました。")
+        except IOError as e: self.logger.error(f"レポート '{filename}' 保存IOエラー: {e}")
+        except Exception as e: self.logger.error(f"レポート '{filename}' 保存中予期せぬエラー: {e}", exc_info=True)
+
+
+    def print_basic_report_to_console(self, report_data: Dict[str, Any]):
+        if not report_data: self.logger.warning("表示するレポートデータが空です。"); return
+        try:
+            print("\n" + "="*10 + " 📈 S&P500 積立タイミング分析レポート 📉 " + "="*10)
+            print(f"分析日時: {report_data.get('analysis_datetime', 'N/A')}")
+            print(f"投資プロファイル: {report_data.get('profile_name', '未設定')} ({report_data.get('profile_description', 'N/A')})")
+            print("-" * 60)
+
+            status = report_data.get('market_status', {})
+            print(f"■ S&P500 現状:")
+            print(f"  - 最新価格 ({status.get('last_price_date', 'N/A')}): {status.get('current_price', 0.0):.2f}")
+            if "VIX" in status: print(f"  - VIX指数: {status['VIX']:.2f}")
+
+            preds = report_data.get('ai_predictions', {})
+            errors = report_data.get('ai_error_rates', {})
+            print("\n■ AI価格予測 (LSTM):")
+            if "nextday_price" in preds:
+                print(f"  - 翌日予測: {preds['nextday_price']:.2f} (MAPE: {errors.get('nextday_mape', 0.0):.2f}%)")
+            short_p = preds.get('short_term', {})
+            if "end_price" in short_p:
+                print(f"  - 短期({short_p.get('days',0)}日後): {short_p['end_price']:.2f} (トレンド: {short_p.get('trend_pct', 0.0):.2f}%, MAPE: {errors.get('short_mape',0.0):.2f}%)")
+            long_p = preds.get('long_term', {})
+            if "end_price" in long_p:
+                print(f"  - 長期({long_p.get('days',0)}日後): {long_p['end_price']:.2f} (トレンド: {long_p.get('trend_pct', 0.0):.2f}%, MAPE: {errors.get('long_mape',0.0):.2f}%)")
+
+            tech = report_data.get('technical_signals', {})
+            print("\n■ テクニカル分析サマリー:")
+            print(f"  - MAクロス: {tech.get('ma_cross_status', '情報なし')}")
+            recent_days = tech.get('recent_days_for_count',0)
+            print(f"  - 直近{recent_days}日のシグナル:")
+            buy_c = tech.get('buy_signal_counts', {})
+            sell_c = tech.get('sell_signal_counts', {})
+            buy_str = ', '.join([f'{k.replace("_signal","")}:{v}' for k,v in buy_c.items() if v>0]) or "なし"
+            sell_str = ', '.join([f'{k.replace("_signal","")}:{v}' for k,v in sell_c.items() if v>0]) or "なし"
+            print(f"    買いシグナル合計: {tech.get('total_buy_score',0)} ({buy_str})")
+            print(f"    売りシグナル合計: {tech.get('total_sell_score',0)} ({sell_str})")
+
+            print("-" * 60)
+            print(f"■ 総合積立アドバイス:\n  {report_data.get('overall_advice', '判断材料不足')}")
+            print("-" * 60 + "\n")
+        except Exception as e: self.logger.error(f"レポートコンソール表示エラー: {e}", exc_info=True)
+
+import numpy as np
+import pandas as pd
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime
+from dataclasses import dataclass
+import json
+
+@dataclass
+class MarketAssessment:
+    """市場評価の総合結果"""
+    trend: str
+    confidence: float
+    risk_level: str
+    tech_score: float
+    ai_reliability: float
+
+class InvestmentAdvisor:
+    """AI予測修正版投資アドバイザー"""
+    
+    # 設定の統一（重複削除）
+    PROFILES = {
+        "natural": {
+            "buy_threshold": 3, 
+            "vix_threshold": 25, 
+            "ai_weight": 2.0, 
+            "confidence_threshold": 0.6
+        },
+        "aggressive": {
+            "buy_threshold": 2, 
+            "vix_threshold": 30, 
+            "ai_weight": 1.5, 
+            "confidence_threshold": 0.4
+        },
+        "conservative": {
+            "buy_threshold": 5, 
+            "vix_threshold": 20, 
+            "ai_weight": 3.0, 
+            "confidence_threshold": 0.8
+        }
+    }
+    
+    # 定数として設定値を定義（マジックナンバー排除）
+    DEFAULT_SP500_PRICE = 5900  # デフォルト価格を統一
+    EXTREME_CHANGE_THRESHOLD_HIGH = 20  # 極端変動の上位閾値
+    EXTREME_CHANGE_THRESHOLD_MID = 10   # 極端変動の中位閾値
+    CONFIDENCE_REDUCTION_HIGH = 0.5     # 高極端値時の信頼度削減率
+    CONFIDENCE_REDUCTION_MID = 0.8      # 中極端値時の信頼度削減率
+    AI_DECLINE_THRESHOLD = -3.0         # AI下落警告閾値
+
+    def __init__(self, market_data_dict: Dict, trained_models_results: Dict, 
+                 logger_manager, advisor_config_file: str = "advisor_config.json", 
+                 initial_profile_name: str = "natural"):
+        self.logger = logger_manager.get_logger(self.__class__.__name__)
+        self.market_data_dict = market_data_dict
+        self.trained_models_results = trained_models_results
+        self.current_profile = initial_profile_name
+        self.profile = self.PROFILES.get(initial_profile_name, self.PROFILES["natural"])
+        self.sp500_df = self._get_sp500_data()
+        self.calculation_errors = []
+        
+        # デバッグ情報出力
+        self.logger.info(f"利用可能な市場データキー: {list(self.market_data_dict.keys())}")
+        self.logger.info(f"利用可能なモデル結果キー: {list(self.trained_models_results.keys())}")
+        
+        # AI予測データの詳細デバッグ（本番環境では無効化可能）
+        if self.logger.level <= 10:  # DEBUG レベル以下の場合のみ実行
+            self._debug_ai_predictions_detailed()
+        
+        self.logger.info(f"InvestmentAdvisor初期化完了 - プロファイル: {self.current_profile}")
+
+    def _get_sp500_data(self) -> Optional[pd.DataFrame]:
+        """S&P500データを安全に取得"""
+        try:
+            for key in ["^GSPC", "SP500", "SPX", "sp500"]:
+                if key in self.market_data_dict:
+                    data = self.market_data_dict[key]
+                    if isinstance(data, dict) and "df" in data:
+                        df = data["df"]
+                        if df is not None and not df.empty:
+                            self.logger.info(f"S&P500データ読み込み成功: {len(df)}行, 列: {list(df.columns)}")
+                            return df
+                    elif isinstance(data, pd.DataFrame) and not data.empty:
+                        self.logger.info(f"S&P500データ読み込み成功: {len(data)}行, 列: {list(data.columns)}")
+                        return data
+            
+            self.logger.error("S&P500データが見つかりません")
+            return pd.DataFrame()
+        except Exception as e:
+            self.logger.error(f"S&P500データ取得エラー: {e}")
+            return pd.DataFrame()
+
+    def _get_current_price(self) -> float:
+        """現在価格を安全に取得（統一メソッド）"""
+        try:
+            if not self.sp500_df.empty:
+                return float(self.sp500_df['Close'].iloc[-1])
+            else:
+                self.logger.warning(f"S&P500データが空のため、デフォルト価格{self.DEFAULT_SP500_PRICE}を使用")
+                return self.DEFAULT_SP500_PRICE
+        except Exception as e:
+            self.logger.error(f"現在価格取得エラー: {e}")
+            return self.DEFAULT_SP500_PRICE
+
+    def _get_current_market_status(self) -> Dict[str, Any]:
+        """現在の市場状況を取得"""
+        if self.sp500_df is None or self.sp500_df.empty:
+            return {"error": "データ不足"}
+        
+        try:
+            latest_row = self.sp500_df.iloc[-1]
+            current_price = float(latest_row["Close"])
+            
+            daily_change = 0
+            if len(self.sp500_df) > 1:
+                prev_price = float(self.sp500_df["Close"].iloc[-2])
+                daily_change = ((current_price - prev_price) / prev_price) * 100
+            
+            vix_value = self._get_vix_value()
+            
+            volatility_5d = 0
+            if len(self.sp500_df) >= 5:
+                returns = self.sp500_df["Close"].pct_change().dropna().tail(5)
+                volatility_5d = float(returns.std() * np.sqrt(252) * 100)
+            
+            status = {
+                "current_price": current_price,
+                "last_price_date": self.sp500_df.index[-1].strftime("%Y-%m-%d"),
+                "volume": float(latest_row.get("Volume", 0)),
+                "daily_change": daily_change,
+                "volatility_5d": volatility_5d,
+                "VIX": vix_value,
+                "vix_level": self._categorize_vix(vix_value)
+            }
+            
+            self.logger.info(f"市場状況: 価格=${current_price:.2f}, 変動={daily_change:.2f}%, VIX={vix_value:.1f}")
+            return status
+            
+        except Exception as e:
+            self.logger.error(f"市場状況取得エラー: {e}")
+            return {"error": str(e)}
+
+    def _get_vix_value(self) -> float:
+        """VIX値を取得（S&P500データから直接取得を優先）"""
+        try:
+            # まずS&P500データ内のVIX列をチェック
+            if not self.sp500_df.empty and 'VIX' in self.sp500_df.columns:
+                vix_series = self.sp500_df['VIX'].dropna()
+                if len(vix_series) > 0:
+                    vix_value = float(vix_series.iloc[-1])
+                    self.logger.info(f"VIX値取得成功: {vix_value} (S&P500データから)")
+                    return vix_value
+            
+            # 次に市場データ辞書から取得
+            self.logger.info("=== VIX値取得開始 ===")
+            self.logger.info(f"利用可能なキー: {list(self.market_data_dict.keys())}")
+            
+            for key in ["VIX", "^VIX", "vix", "volatility"]:
+                if key in self.market_data_dict:
+                    vix_data = self.market_data_dict[key]
+                    self.logger.info(f"VIXキー '{key}' 発見: {type(vix_data)}")
+                    
+                    if isinstance(vix_data, dict):
+                        if "df" in vix_data and not vix_data["df"].empty:
+                            vix_df = vix_data["df"]
+                            if "Close" in vix_df.columns:
+                                vix_value = float(vix_df["Close"].iloc[-1])
+                                self.logger.info(f"VIX値取得成功: {vix_value} (from df)")
+                                return vix_value
+                        elif "Close" in vix_data:
+                            close_data = vix_data["Close"]
+                            if isinstance(close_data, list) and len(close_data) > 0:
+                                vix_value = float(close_data[-1])
+                                self.logger.info(f"VIX値取得成功: {vix_value} (from list)")
+                                return vix_value
+                    elif isinstance(vix_data, (int, float)):
+                        self.logger.info(f"VIX値取得成功: {vix_data} (direct)")
+                        return float(vix_data)
+            
+            # S&P500データからボラティリティを計算
+            if not self.sp500_df.empty:
+                returns = self.sp500_df['Close'].pct_change().dropna().tail(20)
+                volatility = returns.std() * np.sqrt(252) * 100
+                estimated_vix = min(80, max(10, volatility))
+                self.logger.info(f"VIX推定値: {estimated_vix:.1f} (ボラティリティから計算)")
+                return estimated_vix
+            
+            self.logger.warning("VIX値が見つからないため、デフォルト値20.0を使用")
+            return 20.0
+            
+        except Exception as e:
+            self.logger.error(f"VIX取得エラー: {e}")
+            return 20.0
+
+    def _categorize_vix(self, vix_value: float) -> str:
+        """VIX値を分類"""
+        if vix_value < 15:
+            return "低位安定"
+        elif vix_value < 25:
+            return "通常範囲"
+        elif vix_value < 35:
+            return "警戒レベル"
+        else:
+            return "パニックレベル"
+
+    def _calculate_technical_indicators(self) -> Dict[str, Any]:
+        """テクニカル指標を計算（S&P500データから直接取得を優先）"""
+        if self.sp500_df.empty:
+            return {}
+        
+        try:
+            tech_data = {}
+            
+            # RSI（既に計算済みの場合は使用、そうでなければ計算）
+            if 'RSI' in self.sp500_df.columns:
+                current_rsi = self.sp500_df['RSI'].iloc[-1]
+                if pd.notna(current_rsi):
+                    tech_data["rsi_current"] = float(current_rsi)
+                    if current_rsi >= 70:
+                        tech_data["rsi_signal"] = "過買い"
+                    elif current_rsi <= 30:
+                        tech_data["rsi_signal"] = "過売り"
+                    else:
+                        tech_data["rsi_signal"] = "中立"
+            else:
+                # RSI計算
+                if len(self.sp500_df) >= 14:
+                    delta = self.sp500_df['Close'].diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    rs = gain / loss
+                    rsi = 100 - (100 / (1 + rs))
+                    
+                    current_rsi = rsi.iloc[-1]
+                    if pd.notna(current_rsi):
+                        tech_data["rsi_current"] = float(current_rsi)
+                        if current_rsi >= 70:
+                            tech_data["rsi_signal"] = "過買い"
+                        elif current_rsi <= 30:
+                            tech_data["rsi_signal"] = "過売り"
+                        else:
+                            tech_data["rsi_signal"] = "中立"
+            
+            # 移動平均線（既に計算済みの場合は使用）
+            df = self.sp500_df.copy()
+            current_price = df['Close'].iloc[-1]
+            
+            # 既存のMA列があるかチェック
+            ma_columns = [col for col in df.columns if col.startswith('MA') and col[2:].isdigit()]
+            if ma_columns:
+                # 既存のMA列を使用
+                ma_signals = {}
+                for ma_col in ['MA5', 'MA20', 'MA50', 'MA60', 'MA120']:
+                    if ma_col in df.columns:
+                        ma_value = df[ma_col].iloc[-1]
+                        if pd.notna(ma_value):
+                            ma_signals[f"price_vs_{ma_col.lower()}"] = "above" if current_price > ma_value else "below"
+                
+                # MA同士の比較
+                if 'MA5' in df.columns and 'MA20' in df.columns:
+                    ma5_val = df['MA5'].iloc[-1]
+                    ma20_val = df['MA20'].iloc[-1]
+                    if pd.notna(ma5_val) and pd.notna(ma20_val):
+                        ma_signals["ma5_vs_ma20"] = "above" if ma5_val > ma20_val else "below"
+                
+                tech_data["ma_signals"] = ma_signals
+            else:
+                # MA計算
+                if len(df) >= 50:
+                    df['MA5'] = df['Close'].rolling(5).mean()
+                    df['MA20'] = df['Close'].rolling(20).mean()
+                    df['MA50'] = df['Close'].rolling(50).mean()
+                    
+                    latest = df.iloc[-1]
+                    tech_data["ma_signals"] = {
+                        "price_vs_ma5": "above" if current_price > latest['MA5'] else "below",
+                        "price_vs_ma20": "above" if current_price > latest['MA20'] else "below",
+                        "price_vs_ma50": "above" if current_price > latest['MA50'] else "below",
+                        "ma5_vs_ma20": "above" if latest['MA5'] > latest['MA20'] else "below"
+                    }
+            
+            # ゴールデンクロス・デッドクロスチェック
+            if 'golden_cross' in self.sp500_df.columns and 'death_cross' in self.sp500_df.columns:
+                # 最近のクロス信号をチェック
+                recent_data = self.sp500_df.tail(30)  # 過去30日
+                golden_cross_recent = recent_data['golden_cross'].any()
+                death_cross_recent = recent_data['death_cross'].any()
+                
+                if golden_cross_recent:
+                    tech_data["recent_cross"] = "golden"
+                elif death_cross_recent:
+                    tech_data["recent_cross"] = "death"
+                else:
+                    tech_data["recent_cross"] = "none"
+            
+            self.logger.info(f"テクニカル指標計算完了: {tech_data}")
+            return tech_data
+            
+        except Exception as e:
+            self.logger.error(f"テクニカル指標計算エラー: {e}")
+            return {}
+
+    def _get_technical_signals_summary(self) -> Dict[str, Any]:
+        """テクニカルシグナルのサマリー（改良版）"""
+        try:
+            summary = {
+                "ma_cross_status": "MAクロスは30日以内になし",
+                "total_buy_score": 0,
+                "total_sell_score": 0,
+                "recent_days_for_count": 15,
+                "rsi_signal": "中立"
+            }
+            
+            # テクニカル指標を計算
+            tech_indicators = self._calculate_technical_indicators()
+            summary.update(tech_indicators)
+            
+            # 買い売りスコア計算（改良版）
+            buy_score = 0
+            sell_score = 0
+            
+            # RSIベースのスコア
+            if "rsi_signal" in tech_indicators:
+                if tech_indicators["rsi_signal"] == "過売り":
+                    buy_score += 3
+                elif tech_indicators["rsi_signal"] == "過買い":
+                    sell_score += 3
+                else:
+                    # 中立でも微細な判定
+                    rsi_val = tech_indicators.get("rsi_current", 50)
+                    if rsi_val < 40:
+                        buy_score += 1
+                    elif rsi_val > 60:
+                        sell_score += 1
+            
+            # 移動平均ベースのスコア
+            if "ma_signals" in tech_indicators:
+                ma_signals = tech_indicators["ma_signals"]
+                
+                # 価格と移動平均の関係
+                above_count = sum(1 for key, value in ma_signals.items() 
+                                if key.startswith("price_vs_") and value == "above")
+                below_count = sum(1 for key, value in ma_signals.items() 
+                                if key.startswith("price_vs_") and value == "below")
+                
+                if above_count > below_count:
+                    buy_score += above_count
+                else:
+                    sell_score += below_count
+                
+                # 短期MAが長期MAを上回る場合
+                if ma_signals.get("ma5_vs_ma20") == "above":
+                    buy_score += 1
+                else:
+                    sell_score += 1
+            
+            # クロス信号
+            if "recent_cross" in tech_indicators:
+                if tech_indicators["recent_cross"] == "golden":
+                    buy_score += 2
+                    summary["ma_cross_status"] = "直近ゴールデンクロス発生"
+                elif tech_indicators["recent_cross"] == "death":
+                    sell_score += 2
+                    summary["ma_cross_status"] = "直近デッドクロス発生"
+            
+            summary["total_buy_score"] = buy_score
+            summary["total_sell_score"] = sell_score
+            
+            self.logger.info(f"テクニカルサマリー: 買い={buy_score}, 売り={sell_score}")
+            return summary
+            
+        except Exception as e:
+            self.logger.error(f"テクニカル分析エラー: {e}")
+            return {"error": str(e)}
+
+    def _extract_prediction_prices(self):
+        """各モデルの予測価格を抽出"""
+        prediction_prices = {}
+        
+        try:
+            # nextdayモデルの予測価格
+            if 'nextday' in self.trained_models_results:
+                nextday_result = self.trained_models_results['nextday']
+                if 'latest_prediction_original' in nextday_result:
+                    nextday_pred = nextday_result['latest_prediction_original']
+                    if isinstance(nextday_pred, (list, np.ndarray)) and len(nextday_pred) > 0:
+                        prediction_prices['nextday'] = {
+                            'price': round(float(nextday_pred[0]), 2),
+                            'period': '翌日'
+                        }
+                    elif isinstance(nextday_pred, (int, float)):
+                        prediction_prices['nextday'] = {
+                            'price': round(float(nextday_pred), 2),
+                            'period': '翌日'
+                        }
+            
+            # shortモデルの予測価格（最終日）
+            if 'short' in self.trained_models_results:
+                short_result = self.trained_models_results['short']
+                if 'latest_prediction_original' in short_result:
+                    short_pred = short_result['latest_prediction_original']
+                    if isinstance(short_pred, (list, np.ndarray)) and len(short_pred) > 0:
+                        prediction_prices['short'] = {
+                            'price': round(float(short_pred[-1]), 2),
+                            'period': '20日後'
+                        }
+            
+            # longモデルの予測価格（最終日）
+            if 'long' in self.trained_models_results:
+                long_result = self.trained_models_results['long']
+                if 'latest_prediction_original' in long_result:
+                    long_pred = long_result['latest_prediction_original']
+                    if isinstance(long_pred, (list, np.ndarray)) and len(long_pred) > 0:
+                        # 改善1: 長期予測の安定化処理を適用
+                        raw_long_price = self._extract_long_term_prediction(long_pred)
+                        
+                        # 改善2: 現在価格を取得して妥当性チェック
+                        current_price = self._get_current_price()
+                        validated_long_price = self._validate_prediction(current_price, raw_long_price, 'long')
+                        
+                        prediction_prices['long'] = {
+                            'price': round(float(validated_long_price), 2),
+                            'period': '30日後'
+                        }
+                        
+            self.logger.info(f"予測価格抽出完了: {prediction_prices}")
+            return prediction_prices
+            
+        except Exception as e:
+            self.logger.error(f"予測価格抽出エラー: {e}")
+            return {}
+
+    def _extract_long_term_prediction(self, long_pred_array):
+        """長期予測の安定化 - ノイズ削減のため最後の期間の平均を使用"""
+        try:
+            if not isinstance(long_pred_array, (list, np.ndarray)):
+                self.logger.error("長期予測データが配列ではありません")
+                return 0
+                
+            if len(long_pred_array) == 0:
+                self.logger.warning("長期予測配列が空です")
+                return 0
+                
+            if len(long_pred_array) > 20:
+                # 最後の20日間の平均を取る（極端な値を避ける）
+                stable_pred = np.mean(long_pred_array[-20:])
+                original_pred = long_pred_array[-1]
+                self.logger.debug(f"長期予測安定化: 元値={original_pred:.2f} → 安定化値={stable_pred:.2f}")
+                return stable_pred
+            else:
+                return long_pred_array[-1]
+                
+        except Exception as e:
+            self.logger.error(f"長期予測抽出エラー: {e}")
+            # 安全なフォールバック
+            if isinstance(long_pred_array, (list, np.ndarray)) and len(long_pred_array) > 0:
+                return long_pred_array[-1]
+            else:
+                return 0
+
+    def _validate_prediction(self, current_price: float, predicted_price: float, prediction_type: str) -> float:
+        """予測値の妥当性をチェックし、異常値を補正"""
+        try:
+            if current_price <= 0 or predicted_price <= 0:
+                self.logger.warning(f"無効な価格データ: 現在={current_price}, 予測={predicted_price}")
+                return current_price
+                
+            change_pct = ((predicted_price - current_price) / current_price) * 100
+            
+            # 妥当性の閾値設定（期間別）
+            thresholds = {
+                'nextday': (-5, 5),    # ±5%以内
+                'short': (-15, 15),    # ±15%以内  
+                'long': (-25, 25)      # ±25%以内
+            }
+            
+            min_change, max_change = thresholds.get(prediction_type, (-30, 30))
+            
+            if change_pct < min_change or change_pct > max_change:
+                self.logger.warning(f"{prediction_type}予測が異常値: {change_pct:.2f}% → 補正実行")
+                # 異常値の場合は閾値内に補正
+                corrected_change = np.sign(change_pct) * min(abs(change_pct), abs(max_change))
+                corrected_price = current_price * (1 + corrected_change / 100)
+                self.logger.info(f"{prediction_type}予測補正: {predicted_price:.2f} → {corrected_price:.2f}")
+                return corrected_price
+            
+            self.logger.debug(f"{prediction_type}予測は妥当範囲内: {change_pct:.2f}%")
+            return predicted_price
+            
+        except Exception as e:
+            self.logger.error(f"予測値検証エラー: {e}")
+            return current_price  # エラー時は現在価格を返す
+
+    def _log_prediction_summary(self):
+        """予測価格サマリーをログ出力"""
+        try:
+            prediction_prices = self._extract_prediction_prices()
+            
+            self.logger.info("=== AI予測価格サマリー ===")
+            for model_name, pred_data in prediction_prices.items():
+                self.logger.info(f"{model_name}モデル予測価格: ${pred_data['price']:,.2f} ({pred_data['period']})")
+            
+            # 現在価格との比較
+            if not self.sp500_df.empty:
+                current_price = self.sp500_df['Close'].iloc[-1]
+                self.logger.info(f"現在価格: ${current_price:,.2f}")
+                
+                if 'nextday' in prediction_prices:
+                    change = prediction_prices['nextday']['price'] - current_price
+                    change_pct = (change / current_price) * 100
+                    self.logger.info(f"翌日予測変化: ${change:+.2f} ({change_pct:+.2f}%)")
+                    
+        except Exception as e:
+            self.logger.error(f"予測サマリーログエラー: {e}")
+
+    def _calculate_ai_prediction_from_model_data(self, model_result: Dict, model_type: str) -> Tuple[float, float]:
+        """モデルデータから実際のAI予測を計算（型ヒント修正済み）"""
+        try:
+            # パターン1: latest_prediction_originalがある場合
+            if 'latest_prediction_original' in model_result:
+                latest_pred = model_result['latest_prediction_original']
+                if isinstance(latest_pred, (list, np.ndarray)) and len(latest_pred) > 0:
+                    # nextdayは最初の要素、その他は最後の要素
+                    latest_pred = latest_pred[0] if model_type == 'nextday' else latest_pred[-1]
+                
+                if isinstance(latest_pred, (int, float)) and latest_pred != 0:
+                    # 現在の価格を取得（統一メソッド使用）
+                    current_price = self._get_current_price()
+                    
+                    # 変化率計算
+                    change_pct = ((latest_pred - current_price) / current_price) * 100
+                    
+                    # 信頼度計算（MAPEから）
+                    mape = model_result.get('mape_test', 50)
+                    confidence = max(0.1, min(0.9, (100 - mape) / 100))
+                    
+                    self.logger.info(f"{model_type}: 最新予測={latest_pred:.2f}, 現在価格={current_price:.2f}, 変化率={change_pct:.2f}%, MAPE={mape:.2f}%")
+                    return change_pct, confidence
+            
+            # パターン2: y_pred_original_testとy_test_original_testから計算
+            if 'y_pred_original_test' in model_result and 'y_test_original_test' in model_result:
+                pred_data = model_result['y_pred_original_test']
+                actual_data = model_result['y_test_original_test']
+                
+                if (isinstance(pred_data, list) and isinstance(actual_data, list) and 
+                    len(pred_data) > 0 and len(actual_data) > 0):
+                    # 最新の予測と実際の値
+                    latest_pred = pred_data[-1]
+                    latest_actual = actual_data[-1] if len(actual_data) > 0 else latest_pred
+                    
+                    # 変化率計算
+                    if latest_actual != 0:
+                        change_pct = ((latest_pred - latest_actual) / latest_actual) * 100
+                    else:
+                        change_pct = 0
+                    
+                    # 信頼度計算（MAPEから）
+                    mape = model_result.get('mape_test', 50)
+                    confidence = max(0.1, min(0.9, (100 - mape) / 100))
+                    
+                    self.logger.info(f"{model_type}: 予測={latest_pred:.2f}, 実際={latest_actual:.2f}, 変化率={change_pct:.2f}%, MAPE={mape:.2f}%")
+                    return change_pct, confidence
+            
+            # パターン3: predict_stepを使用した将来予測
+            if 'predict_step' in model_result:
+                predict_step = model_result['predict_step']
+                current_price = self._get_current_price()
+                
+                # 簡易的な予測（実際のモデルロジックに基づいて調整が必要）
+                if not self.sp500_df.empty and len(self.sp500_df) >= predict_step:
+                    past_returns = self.sp500_df['Close'].pct_change().dropna().tail(predict_step)
+                    if len(past_returns) > 0:
+                        avg_return = past_returns.mean()
+                        predicted_price = current_price * (1 + avg_return * predict_step)
+                        change_pct = ((predicted_price - current_price) / current_price) * 100
+                        
+                        mape = model_result.get('mape_test', 30)
+                        confidence = max(0.1, min(0.9, (100 - mape) / 100))
+                        
+                        self.logger.info(f"{model_type}: 段階予測={predict_step}, 変化率={change_pct:.2f}%, MAPE={mape:.2f}%")
+                        return change_pct, confidence
+            
+            self.logger.warning(f"{model_type}: 予測データの計算に失敗")
+            return 0.0, 0.5
+            
+        except Exception as e:
+            self.logger.error(f"{model_type} AI予測計算エラー: {e}")
+            return 0.0, 0.5
+
+    def _get_ai_predictions_summary(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """AI予測のサマリーを取得（キー統一版）"""
+        predictions = {}
+        model_errors = {}  # 変数名を明確化
+        
+        try:
+            self.logger.info("=== AI予測サマリー生成開始（修正版） ===")
+            
+            # 各モデルの結果を個別に処理
+            for model_key, model_result in self.trained_models_results.items():
+                if not isinstance(model_result, dict):
+                    continue
+                
+                self.logger.info(f"処理中のモデル: {model_key}")
+                
+                # AI予測を計算
+                trend_pct, confidence = self._calculate_ai_prediction_from_model_data(model_result, model_key)
+                
+                # MAPE取得
+                mape = model_result.get('mape_test', 50)
+                model_errors[f"{model_key}_mape"] = mape
+                
+                # モデルタイプ別に分類（キーを統一）
+                if 'long' in model_key.lower():
+                    predictions["long_term"] = {"trend_pct": trend_pct, "confidence": confidence}
+                elif 'short' in model_key.lower():
+                    predictions["short_term"] = {"trend_pct": trend_pct, "confidence": confidence}
+                elif 'nextday' in model_key.lower() or 'next' in model_key.lower():
+                    # nextday_priceに統一
+                    predictions["nextday_price"] = {"change_pct": trend_pct, "confidence": confidence}
+                else:
+                    # デフォルトは長期として扱う
+                    predictions["long_term"] = {"trend_pct": trend_pct, "confidence": confidence}
+            
+            # 予測が空の場合の処理
+            if not predictions.get("long_term"):
+                # 最も信頼できるモデルから長期予測を生成
+                best_model = None
+                best_mape = float('inf')
+                
+                for model_key, model_result in self.trained_models_results.items():
+                    if isinstance(model_result, dict) and 'mape_test' in model_result:
+                        mape = model_result.get('mape_test', 100)
+                        if mape < best_mape:
+                            best_mape = mape
+                            best_model = model_key
+                
+                if best_model:
+                    trend_pct, confidence = self._calculate_ai_prediction_from_model_data(
+                        self.trained_models_results[best_model], best_model
+                    )
+                    predictions["long_term"] = {"trend_pct": trend_pct, "confidence": confidence}
+                    self.logger.info(f"最良モデル {best_model} から長期予測生成: {trend_pct:.2f}%")
+            
+            self.logger.info(f"最終的なAI予測: {predictions}")
+            return predictions, model_errors
+            
+        except Exception as e:
+            self.logger.error(f"AI予測サマリー取得エラー: {e}")
+            return {}, {}
+
+
+    def _generate_comprehensive_market_assessment(self, market_status: Dict, predictions: Dict,
+                                                  model_errors: Dict, tech_signals: Dict) -> MarketAssessment:
+        """修正版: AI予測を最優先する総合評価"""
+        try:
+            # === STEP 1: AI予測の信頼性評価 ===
+            long_term_pred = predictions.get("long_term", {})
+            ai_confidence = long_term_pred.get("confidence", 0.0) # デフォルト値をfloatに
+            ai_trend = long_term_pred.get("trend_pct", 0.0)     # デフォルト値をfloatに
+
+            trend = "neutral"  # デフォルト値を設定
+            final_confidence = 0.5 # デフォルト値を設定
+
+            # === STEP 2: AI信頼度が高い場合は最優先 ===
+            if ai_confidence > 0.80:  # 高信頼度AI予測
+                self.logger.info(f"高信頼度AI予測モード: 信頼度={ai_confidence:.1%}, 予測={ai_trend:.2f}%")
+
+                # AI予測ベースの直接判定
+                if ai_trend < -3.0:
+                    trend = "bearish"
+                    final_confidence = ai_confidence * 0.95  # 高信頼度を維持
+                elif ai_trend > 3.0:
+                    trend = "bullish"
+                    final_confidence = ai_confidence * 0.95
+                else:
+                    trend = "neutral"
+                    final_confidence = ai_confidence * 0.90
+
+                # テクニカル分析は補正のみに使用
+                buy_score = tech_signals.get("total_buy_score", 0)
+                sell_score = tech_signals.get("total_sell_score", 0)
+
+                # 極端なテクニカル逆信号の場合のみ微調整
+                if trend == "bearish" and buy_score > 8:  # 極端な買いシグナル
+                    final_confidence *= 0.9  # 信頼度を僅かに下げる
+                elif trend == "bullish" and sell_score > 8:  # 極端な売りシグナル
+                    final_confidence *= 0.9
+
+            else:
+                # === STEP 3: 低信頼度の場合は従来ロジック ===
+                self.logger.info(f"低信頼度モード: 信頼度={ai_confidence:.1%}")
+                # 従来の加重平均ロジックを使用
+                weights = {'nextday_price': 0.4, 'short_term': 0.4, 'long_term': 0.2}
+                weighted_trend = 0.0 # floatで初期化
+                total_weight = 0.0   # floatで初期化
+
+                for period in ['nextday_price', 'short_term', 'long_term']:
+                    pred_key = 'change_pct' if period == 'nextday_price' else 'trend_pct'
+                    pred = predictions.get(period, {})
+                    trend_val = pred.get(pred_key, 0.0) # デフォルト値をfloatに
+                    conf = pred.get('confidence', 0.0) # デフォルト値をfloatに
+                    weight = weights[period] * conf
+                    weighted_trend += trend_val * weight
+                    total_weight += weight
+
+                final_trend = weighted_trend / total_weight if total_weight > 0 else 0.0
+                final_confidence = total_weight / sum(weights.values()) if sum(weights.values()) > 0 else 0.5
+
+                # 従来の閾値判定
+                if final_trend < -3:
+                    trend = "bearish"
+                elif final_trend > 3:
+                    trend = "bullish"
+                else:
+                    trend = "neutral"
+
+            # === 以下リスク評価は従来通り ===
+            vix_value = market_status.get("VIX", 20.0) # デフォルト値をfloatに
+            volatility = market_status.get("volatility_5d", 0.0) # デフォルト値をfloatに
+            risk_factors = 0
+
+            if vix_value > 30: risk_factors += 3
+            elif vix_value > 25: risk_factors += 2
+            elif vix_value > 20: risk_factors += 1
+            if volatility > 25: risk_factors += 2
+            elif volatility > 15: risk_factors += 1
+            if final_confidence < 0.4: risk_factors += 1
+
+            if risk_factors >= 5:
+                risk_level = "high"
+            elif risk_factors >= 2:
+                risk_level = "medium"
+            else:
+                risk_level = "low"
+
+            # テクニカルスコア
+            buy_score_tech = tech_signals.get("total_buy_score", 0) # 変数名を変更 (buy_score は上で使用済み)
+            sell_score_tech = tech_signals.get("total_sell_score", 0) # 変数名を変更
+            total_signals = buy_score_tech + sell_score_tech
+            tech_score = buy_score_tech / total_signals if total_signals > 0 else 0.5
+            tech_score = max(0.0, min(1.0, tech_score))
+
+            result = MarketAssessment(
+                trend=trend,
+                confidence=max(0.1, min(0.9, final_confidence)),
+                risk_level=risk_level,
+                tech_score=tech_score,
+                ai_reliability=ai_confidence
+            )
+
+            self.logger.info(f"修正版総合評価: {trend}, AI信頼度={ai_confidence:.1%}, 最終信頼度={final_confidence:.2f}, リスク={risk_level}, Techスコア={tech_score:.2f}")
+            return result
+
+        except Exception as e:
+            self.logger.error(f"総合市場評価エラー: {e}", exc_info=True)
+            return MarketAssessment(
+                trend="neutral", confidence=0.5, risk_level="high",
+                tech_score=0.5, ai_reliability=0.5
+            )
+
